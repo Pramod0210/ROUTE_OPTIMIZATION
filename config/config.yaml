@@ -1,11 +1,7 @@
-paths:
-  raw_data: "data/raw/"
-  processed_data: "data/processed/"
-  results: "results/runs/"
-
 constraints:
   max_bus_km_per_month: 4500
   max_bus_km_per_day: 150
+  max_bus_time_per_day: 900 # minutes
   max_occupancy: 0.9
   stop_wait_time: 3
   reserve_buses: 3
@@ -14,3 +10,31 @@ constraints:
 calendar:
   regular_start: "08:00"
   exam_start: "09:00"
+
+
+paths:
+  raw_data: "data/raw"
+  processed_data: "data/processed"
+  geocode_cache: "data/geocode_cache.csv"
+  logs: "logs"
+  school_master: "data/raw/school_master.csv"
+
+geocode:
+  nominatim_delay: 1.1
+  sleep_between_calls: 0.2
+  max_retries: 3
+
+validation:
+  max_city_radius_km: 100.0
+
+address_keywords:
+  - "school location"
+  - "pickup address"
+  - "drop address"
+  - "parking spot"
+
+
+lat_suffix: "_lat"
+lon_suffix: "_lon"
+
+app_user_agent: "school-transport-optimizer/1.0"
