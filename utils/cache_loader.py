@@ -2,6 +2,8 @@ from pathlib import Path
 import pandas as pd
 import logging
 from typing import Dict, Any, Optional
+from pandas.errors import EmptyDataError
+
 
 # Default cache file location (relative to project root)
 DEFAULT_CACHE_PATH = Path("data") / "geocode_cache.csv"
@@ -18,24 +20,15 @@ def safe_float(x: Any) -> Optional[float]:
 
 
 def load_cache(cache_path: Path = DEFAULT_CACHE_PATH) -> Dict[str, Dict[str, Any]]:
-    """
-    Load a geocoding cache from a CSV file.
-
-    Expected columns:
-        - query: unique string used as lookup
-        - lat: latitude (float)
-        - lon: longitude (float)
-        - provider: geocoding provider name
-
-    :param cache_path: Path to cache CSV file (defaults to DEFAULT_CACHE_PATH)
-    :return: Dictionary with query as key and dict with lat, lon, provider as value
-    """
     if not cache_path.exists():
-        logging.info(f"Cache file not found at {cache_path}, starting with empty cache.")
+        logging.info(f"No cache at {cache_path}; starting with empty cache.")
         return {}
-
     try:
-        df = pd.read_csv(cache_path, dtype=str).fillna("")
+        df = pd.read_csv(cache_path, dtype=str)
+        if df.empty:
+            logging.info(f"Cache file {cache_path} is empty; starting with empty cache.")
+            return {}
+        df = df.fillna("")
         cache = {}
         for _, r in df.iterrows():
             cache[r["query"]] = {
@@ -43,10 +36,15 @@ def load_cache(cache_path: Path = DEFAULT_CACHE_PATH) -> Dict[str, Dict[str, Any
                 "lon": safe_float(r.get("lon")),
                 "provider": r.get("provider", "")
             }
+        logging.info(f"Loaded {len(cache)} cached geocodes from {cache_path}")
         return cache
-    except Exception as e:
-        logging.warning(f"Failed to load cache: {e} - starting fresh.")
+    except EmptyDataError:
+        logging.info(f"Cache file {cache_path} empty (EmptyDataError); starting fresh.")
         return {}
+    except Exception as e:
+        logging.warning(f"Failed to load cache {cache_path}: {e} - starting fresh.")
+        return {}
+
 
 
 def save_cache(cache: Dict[str, Dict[str, Any]], cache_path: Path = DEFAULT_CACHE_PATH) -> None:

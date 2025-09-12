@@ -1,6 +1,6 @@
 import pandas as pd
 
-def is_text_dtype(self, series: pd.Series) -> bool:
+def is_text_dtype(series: pd.Series) -> bool:
     """
     Checks if a Pandas Series is of textual type.
 

@@ -17,7 +17,7 @@ paths:
   processed_data: "data/processed"
   geocode_cache: "data/geocode_cache.csv"
   logs: "logs"
-  school_master: "data/raw/school_master.csv"
+  school_master: "data/raw/School_Master.xlsx"
 
 geocode:
   nominatim_delay: 1.1

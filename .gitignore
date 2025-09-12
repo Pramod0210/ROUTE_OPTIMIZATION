@@ -9,4 +9,6 @@ wheels/
 # Virtual environments
 myvenv
 .env
-data
+data/
+raw_data/
+ROUTE_OPTIMIZATION.egg-info

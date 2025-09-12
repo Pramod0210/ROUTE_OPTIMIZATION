@@ -25,7 +25,7 @@ from geopy.exc import GeopyError
 
 # ---------- Main class ----------
 class GeocodeCleaner:
-    def __init__(self, config_path: str = "config/config.yaml"):
+    def __init__(self):
         # load config
         self.cfg = load_config()
         # setup paths
@@ -62,6 +62,12 @@ class GeocodeCleaner:
     # ---------- Helpers ----------
 
     def _find_address_cols(self, df: pd.DataFrame) -> List[str]:
+        """
+        Finds columns in a DataFrame that contain address information.
+
+        :param df: DataFrame to search for address columns
+        :return: List of column names that contain address information
+        """
         cols = []
         for c in df.columns:
             low = c.lower()
@@ -71,6 +77,13 @@ class GeocodeCleaner:
 
     # ---------- Geocode with caching ----------
     def geocode_with_cache(self, query: str) -> Optional[Dict[str, Any]]:
+        """
+        Geocode a query using the cache, Google Maps (if available) and Nominatim as a fallback.
+
+        :param query: query to geocode
+        :return: dict with lat, lon and provider (or None if failed)
+        """
+
         if not isinstance(query, str) or not query.strip():
             return None
         key = query.strip().lower()
@@ -112,11 +125,37 @@ class GeocodeCleaner:
     # ---------- City validation ----------
     def _load_school_centers(self) -> Dict[str, Dict[str, Any]]:
         # expects school_master path csv with columns school_name, school_branch, school_location (human) or lat/lon present
+        """
+        Load school centers from a CSV file.
+
+        Expects a CSV file at `self.school_master_file` with columns:
+
+        - school_name
+        - school_branch
+        - school_location (human-readable, optional)
+        - school_lat (optional)
+        - school_lon (optional)
+
+        Returns a dictionary with school_name__school_branch as keys and
+        another dictionary with lat, lon and location_text as values.
+
+        If the file is not found, city validation is disabled and an empty
+        dictionary is returned.
+        """
         p = Path(self.school_master_file)
         if not p.exists():
             logging.warning(f"School master {p} not found; city validation disabled")
             return {}
-        df = pd.read_csv(p, dtype=str).fillna("")
+        
+        if p.suffix.lower() == ".csv":
+            df = pd.read_csv(p, dtype=str).fillna("")
+        elif p.suffix.lower() == ".xlsx":
+            df = pd.read_excel(p, dtype=str, engine="openpyxl").fillna("")
+        else:
+            logging.warning(f"Skipping unsupported file type: {p.name}")
+
+
+        # df = pd.read_excel(p, dtype=str).fillna("")
         # normalize columns
         df.rename(columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
         centers = {}
@@ -129,6 +168,26 @@ class GeocodeCleaner:
         return centers
 
     def _is_within_school_area(self, school_key: str, lat: float, lon: float) -> bool:
+        """
+        Check if a given lat, lon is within the area of a school (with key school_key)
+        in the school master list.
+
+        If the school center is not found in the school master list, or if the
+        center does not have a valid lat/lon, this function returns True (assuming
+        the point is within the school area).
+
+        If the distance between the point and the school center is None (e.g. due
+        to invalid lat/lon values), this function returns False.
+
+        Otherwise, this function returns True if the distance between the point and
+        the school center is less than or equal to the maximum city radius (in km),
+        and False otherwise.
+
+        :param school_key: key of the school to check (e.g. 'school_name__school_branch')
+        :param lat: latitude of the point to check
+        :param lon: longitude of the point to check
+        :return: True if the point is within the school area, False otherwise
+        """
         centers = getattr(self, "_school_centers", None)
         if centers is None:
             self._school_centers = self._load_school_centers()
@@ -152,12 +211,21 @@ class GeocodeCleaner:
         force_regeocode: if True, geocode even if lat/lon present or in cache
         """
         logging.info(f"Processing file: {file_path.name}")
-        df = pd.read_csv(file_path, dtype=str)
+
+        if file_path.suffix.lower() == ".csv":
+            df = pd.read_csv(file_path, dtype=str)
+        elif file_path.suffix.lower() == ".xlsx":
+            df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+        else:
+            logging.warning(f"Skipping unsupported file type: {file_path.name}")
+
+        # df = pd.read_excel(file_path, dtype=str)
         # normalize column names
-        df.rename(columns={c: c.strip().lower().replace(" ", "_"): c for c in df.columns}, inplace=True)  # map old names to normalized keys
+        df.rename(
+        columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
         # lowercase textual columns
         for col in list(df.columns):
-            if self.is_text_dtype(df[col]):
+            if is_text_dtype(df[col]):
                 df[col] = df[col].fillna("").astype(str).str.strip().str.lower()
         # detect address-like columns
         address_cols = self._find_address_cols(df)
@@ -265,25 +333,68 @@ class GeocodeCleaner:
             issues_df.to_csv(issues_out.with_suffix(".csv"), index=False)
             logging.info(f"  issues written to {issues_out.with_suffix('.csv')}")
         # save updated cache
-        self.save_cache(self.cache)
+        save_cache(self.cache)
         return out_path
 
     # ---------- Batch processing ----------
     def process_all_csvs(self, school_columns_map: Optional[Dict[str,str]] = None, force_regeocode: bool = False):
-        files = sorted([p for p in self.raw_dir.glob("*.csv")])
+        """
+        Process all CSV files in the raw data directory.
+
+        :param school_columns_map: Optional mapping of column names for school name/branch (if different from default)
+        :param force_regeocode: If True, re-geocode all address columns even if they already have lat/lon values
+
+        For each CSV file, calls process_file with the given parameters and logs any exceptions that occur.
+
+        Returns None.
+        """
+
+        # Pick up .csv and .xlsx files
+        files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in [".csv", ".xlsx", ".xls"]])
+        logging.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
         if not files:
-            logging.warning("No CSV files found in raw dir.")
+            logging.warning("No CSV or Excel files found in raw dir.")
             return
+
         for f in files:
+            logging.info(f"--- Processing file: {f.name} ---")
             try:
-                self.process_file(f, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
+                if f.suffix.lower() == ".csv":
+                    df = pd.read_csv(f, dtype=str)
+                elif f.suffix.lower() == ".xlsx":
+                    # ensure openpyxl installed; specify engine
+                    df = pd.read_excel(f, dtype=str, engine="openpyxl")
+                elif f.suffix.lower() == ".xls":
+                    df = pd.read_excel(f, dtype=str, engine="xlrd")
+                else:
+                    logging.warning(f"Skipping unsupported file type: {f.name}")
+                    continue
+
+                # ensure temporary CSV file (same stem) is created and used for processing
+                tmp_csv = (self.raw_dir / f"{f.stem}.tmp.csv")
+                df.to_csv(tmp_csv, index=False)
+                logging.info(f"Saved temporary CSV for processing: {tmp_csv.name}")
+
+                # call process_file on the tmp csv
+                self.process_file(tmp_csv, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
+
+                # remove tmp csv after processing
+                try:
+                    tmp_csv.unlink()
+                except Exception:
+                    pass
+
             except Exception as e:
                 logging.exception(f"Failed processing {f.name}: {e}")
 
+        logging.info("Done processing all files.")
+
+
+
 # ---------- CLI ----------
 if __name__ == "__main__":
-    cleaner = GeocodeCleaner(config_path="config/config.yaml")
+    cleaner = GeocodeCleaner()
     # Optional: provide mapping if your files use different column names for school name/branch
     # Example: {"school_name": "school_name", "school_branch": "school_branch"}
-    school_map = {"school_name": "school_name", "school_branch": "school_branch"}
+    school_map = {"School Name": "school_name", "School Branch": "school_branch"}
     cleaner.process_all_csvs(school_columns_map=school_map, force_regeocode=False)
