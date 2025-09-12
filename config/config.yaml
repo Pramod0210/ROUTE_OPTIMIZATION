@@ -1,0 +1,16 @@
+paths:
+  raw_data: "data/raw/"
+  processed_data: "data/processed/"
+  results: "results/runs/"
+
+constraints:
+  max_bus_km_per_month: 4500
+  max_bus_km_per_day: 150
+  max_occupancy: 0.9
+  stop_wait_time: 3
+  reserve_buses: 3
+  max_student_ride_time: 60  # minutes
+
+calendar:
+  regular_start: "08:00"
+  exam_start: "09:00"
