@@ -12,6 +12,9 @@ from utils.config_loader import load_config
 from utils.cache_loader import safe_float, load_cache, save_cache
 from utils.haversine_distance import haversine_km
 from utils.helpers import is_text_dtype
+from logger.custom_logger import CustomLogger
+from exception.custom_exception import CustomException
+import re
 
 # Optional imports - googlemaps may be absent
 try:
@@ -26,6 +29,8 @@ from geopy.exc import GeopyError
 # ---------- Main class ----------
 class GeocodeCleaner:
     def __init__(self):
+
+        self.log = CustomLogger().get_logger(__name__)
         # load config
         self.cfg = load_config()
         # setup paths
@@ -33,8 +38,7 @@ class GeocodeCleaner:
         self.raw_dir = self.base / Path(self.cfg["paths"]["raw_data"])
         self.proc_dir = self.base / Path(self.cfg["paths"]["processed_data"])
         # self.cache_path = self.base / Path(self.cfg["paths"].get("geocode_cache", "data/geocode_cache.csv"))
-        self.log_dir = self.base / Path(self.cfg["paths"].get("logs", "logs"))
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+
         self.proc_dir.mkdir(parents=True, exist_ok=True)
         # load env
         load_dotenv()
@@ -61,18 +65,35 @@ class GeocodeCleaner:
 
     # ---------- Helpers ----------
 
+    def _normalize_text(self, x: str) -> str:
+        """Lowercase and remove non-alphanumeric characters for stable matching."""
+        if not isinstance(x, str):
+            return ""
+        x = x.strip().lower()
+        # replace runs of non-alphanumeric with single underscore
+        x = re.sub(r"[^0-9a-z]+", "_", x)
+        # strip leading/trailing underscores
+        x = x.strip("_")
+        return x
+    
+    
     def _find_address_cols(self, df: pd.DataFrame) -> List[str]:
         """
-        Finds columns in a DataFrame that contain address information.
-
-        :param df: DataFrame to search for address columns
-        :return: List of column names that contain address information
+        Robustly find address-like columns by normalizing both column names and keywords.
         """
         cols = []
+        # pre-normalize keywords once
+        normalized_keywords = [ self._normalize_text(k) for k in self.address_keywords ]
+        self.log.info(f"Normalized address keywords: {normalized_keywords}")
+
         for c in df.columns:
-            low = c.lower()
-            if any(k in low for k in self.address_keywords):
+            low = str(c).strip().lower()
+            norm_col = self._normalize_text(low)
+            self.log.debug(f"Checking column '{c}' -> normalized: '{norm_col}'")
+            # Match if any normalized keyword is substring of normalized column name
+            if any(k in norm_col for k in normalized_keywords):
                 cols.append(c)
+        self.log.info(f"Found address columns: {cols}")
         return cols
 
     # ---------- Geocode with caching ----------
@@ -96,10 +117,13 @@ class GeocodeCleaner:
                 res = self.gmaps_client.geocode(key)
                 if res:
                     loc = res[0]["geometry"]["location"]
+                    # self.log.info(f"Google geocode result for {key}: {loc}")
                     result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google"}
+                self.log.info(f"Google geocode result completed")
             except Exception as e:
-                logging.debug(f"Google geocode error for {key}: {e}")
+                self.log.warning(f"Google geocode error for {key}: {e}")
                 result = None
+                raise CustomException(f"Google geocode error for {key}: {e}")
         # fallback to nominatim
         if result is None:
             for attempt in range(self.max_retries):
@@ -108,11 +132,13 @@ class GeocodeCleaner:
                     loc = self.nom_rate_limiter(key)
                     if loc:
                         result = {"lat": float(loc.latitude), "lon": float(loc.longitude), "provider": "nominatim"}
+                        self.log.info(f"Nominatim geocode result for {key}: {result}")
                     break
                 except GeopyError as ge:
-                    logging.debug(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
+                    self.log.info(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
                     time.sleep(1 + attempt * 2)
                     continue
+
         # store in cache (even negative result)
         if result is None:
             self.cache[key] = {"lat": None, "lon": None, "provider": None}
@@ -144,7 +170,7 @@ class GeocodeCleaner:
         """
         p = Path(self.school_master_file)
         if not p.exists():
-            logging.warning(f"School master {p} not found; city validation disabled")
+            self.log.warning(f"School master {p} not found; city validation disabled")
             return {}
         
         if p.suffix.lower() == ".csv":
@@ -152,7 +178,7 @@ class GeocodeCleaner:
         elif p.suffix.lower() == ".xlsx":
             df = pd.read_excel(p, dtype=str, engine="openpyxl").fillna("")
         else:
-            logging.warning(f"Skipping unsupported file type: {p.name}")
+            self.log.warning(f"Skipping unsupported file type: {p.name}")
 
 
         # df = pd.read_excel(p, dtype=str).fillna("")
@@ -165,6 +191,7 @@ class GeocodeCleaner:
             lon = safe_float(r.get("schoollon") or r.get("school_lon") or r.get("school_longitude"))
             location_text = r.get("school_location", "")
             centers[key] = {"lat": lat, "lon": lon, "location": location_text}
+        self.log.info(f"Loaded {len(centers)} school centers from {p}")
         return centers
 
     def _is_within_school_area(self, school_key: str, lat: float, lon: float) -> bool:
@@ -210,14 +237,14 @@ class GeocodeCleaner:
         school_columns_map: optional mapping to identify school name/branch columns in the file (keys: 'school_name','school_branch')
         force_regeocode: if True, geocode even if lat/lon present or in cache
         """
-        logging.info(f"Processing file: {file_path.name}")
+        self.log.info(f"Processing file: {file_path}")
 
         if file_path.suffix.lower() == ".csv":
             df = pd.read_csv(file_path, dtype=str)
         elif file_path.suffix.lower() == ".xlsx":
             df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
         else:
-            logging.warning(f"Skipping unsupported file type: {file_path.name}")
+            self.log.warning(f"Skipping unsupported file type: {file_path.name}")
 
         # df = pd.read_excel(file_path, dtype=str)
         # normalize column names
@@ -229,7 +256,7 @@ class GeocodeCleaner:
                 df[col] = df[col].fillna("").astype(str).str.strip().str.lower()
         # detect address-like columns
         address_cols = self._find_address_cols(df)
-        logging.info(f"  detected address-like columns: {address_cols}")
+        self.log.info(f"Found {len(address_cols)} address-like columns in {file_path}")
         # attempt to find school key for validation
         school_key = None
         if school_columns_map:
@@ -241,6 +268,8 @@ class GeocodeCleaner:
                     sname = str(df[sname_col].iloc[0]).strip().lower()
                     sbranch = str(df[sbranch_col].iloc[0]).strip().lower()
                     school_key = f"{sname}__{sbranch}"
+                    self.log.info(f"Found school key: {school_key}")
+
                 except Exception:
                     school_key = None
 
@@ -266,7 +295,7 @@ class GeocodeCleaner:
 
             # reduce to unique addresses to minimize calls
             unique_addrs = df.loc[mask_need, col].dropna().unique().tolist()
-            logging.info(f"  {len(unique_addrs)} unique addresses to geocode for column '{col}'")
+            self.log.info(f"Geocoding {len(unique_addrs)} unique addresses for column '{col}'")
 
             for addr in tqdm(unique_addrs, desc=f"Geocoding {file_path.name}:{col}", leave=False):
                 res = self.geocode_with_cache(addr)
@@ -288,6 +317,7 @@ class GeocodeCleaner:
                                 sbranch_r = str(df.at[i, school_columns_map.get("school_branch")]).strip().lower()
                                 if sname_r:
                                     per_row_school_key = f"{sname_r}__{sbranch_r}"
+                                self.log.info(f"Found per-row school key: {per_row_school_key}")
                             except Exception:
                                 per_row_school_key = school_key
                         # city/proximity check
@@ -324,14 +354,14 @@ class GeocodeCleaner:
         # write processed file
         out_path = self.proc_dir / file_path.name
         df.to_csv(out_path, index=False)
-        logging.info(f"  wrote processed file: {out_path}")
+        self.log.info(f"  wrote processed file: {out_path}")
 
         # save issues for manual review
         if issues:
             issues_df = pd.DataFrame(issues)
             issues_out = self.log_dir / f"geocode_issues__{file_path.name}"
             issues_df.to_csv(issues_out.with_suffix(".csv"), index=False)
-            logging.info(f"  issues written to {issues_out.with_suffix('.csv')}")
+            self.log.info(f"  issues written to {issues_out.with_suffix('.csv')}")
         # save updated cache
         save_cache(self.cache)
         return out_path
@@ -351,13 +381,13 @@ class GeocodeCleaner:
 
         # Pick up .csv and .xlsx files
         files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in [".csv", ".xlsx", ".xls"]])
-        logging.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
+        self.log.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
         if not files:
-            logging.warning("No CSV or Excel files found in raw dir.")
+            self.log.warning("No CSV or Excel files found in raw dir.")
             return
 
         for f in files:
-            logging.info(f"--- Processing file: {f.name} ---")
+            self.log.info(f"--- Processing file: {f.name} ---")
             try:
                 if f.suffix.lower() == ".csv":
                     df = pd.read_csv(f, dtype=str)
@@ -367,13 +397,13 @@ class GeocodeCleaner:
                 elif f.suffix.lower() == ".xls":
                     df = pd.read_excel(f, dtype=str, engine="xlrd")
                 else:
-                    logging.warning(f"Skipping unsupported file type: {f.name}")
+                    self.log.warning(f"Skipping unsupported file type: {f.name}")
                     continue
 
                 # ensure temporary CSV file (same stem) is created and used for processing
                 tmp_csv = (self.raw_dir / f"{f.stem}.tmp.csv")
                 df.to_csv(tmp_csv, index=False)
-                logging.info(f"Saved temporary CSV for processing: {tmp_csv.name}")
+                self.log.info(f"  wrote temporary CSV for processing: {tmp_csv.name}")
 
                 # call process_file on the tmp csv
                 self.process_file(tmp_csv, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
@@ -385,9 +415,9 @@ class GeocodeCleaner:
                     pass
 
             except Exception as e:
-                logging.exception(f"Failed processing {f.name}: {e}")
-
-        logging.info("Done processing all files.")
+                raise CustomException(f"Failed processing {f.name}: {e}")
+                self.log.error(f"Failed processing {f.name}: {e}")
+        self.log.info("Done processing all files.")
 
 
 
