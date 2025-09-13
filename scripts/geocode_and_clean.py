@@ -15,6 +15,9 @@ from utils.helpers import is_text_dtype
 from logger.custom_logger import CustomLogger
 from exception.custom_exception import CustomException
 import re
+import tempfile
+import time
+import uuid
 
 # Optional imports - googlemaps may be absent
 try:
@@ -38,7 +41,8 @@ class GeocodeCleaner:
         self.raw_dir = self.base / Path(self.cfg["paths"]["raw_data"])
         self.proc_dir = self.base / Path(self.cfg["paths"]["processed_data"])
         # self.cache_path = self.base / Path(self.cfg["paths"].get("geocode_cache", "data/geocode_cache.csv"))
-
+        self.log_dir = self.base / Path(self.cfg["paths"].get("logs", "logs"))
+        self.log_dir.mkdir(parents=True, exist_ok=True)
         self.proc_dir.mkdir(parents=True, exist_ok=True)
         # load env
         load_dotenv()
@@ -119,9 +123,9 @@ class GeocodeCleaner:
                     loc = res[0]["geometry"]["location"]
                     # self.log.info(f"Google geocode result for {key}: {loc}")
                     result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google"}
-                self.log.info(f"Google geocode result completed")
+                # self.log.info(f"Google geocode result completed")
             except Exception as e:
-                self.log.warning(f"Google geocode error for {key}: {e}")
+                # self.log.warning(f"Google geocode error for {key}: {e}")
                 result = None
                 raise CustomException(f"Google geocode error for {key}: {e}")
         # fallback to nominatim
@@ -132,10 +136,10 @@ class GeocodeCleaner:
                     loc = self.nom_rate_limiter(key)
                     if loc:
                         result = {"lat": float(loc.latitude), "lon": float(loc.longitude), "provider": "nominatim"}
-                        self.log.info(f"Nominatim geocode result for {key}: {result}")
+                    # self.log.info(f"Nominatim geocode completed")
                     break
                 except GeopyError as ge:
-                    self.log.info(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
+                    # self.log.info(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
                     time.sleep(1 + attempt * 2)
                     continue
 
@@ -367,58 +371,116 @@ class GeocodeCleaner:
         return out_path
 
     # ---------- Batch processing ----------
-    def process_all_csvs(self, school_columns_map: Optional[Dict[str,str]] = None, force_regeocode: bool = False):
+    # def process_all_csvs(self, school_columns_map: Optional[Dict[str,str]] = None, force_regeocode: bool = False):
+    #     """
+    #     Process all CSV files in the raw data directory.
+
+    #     :param school_columns_map: Optional mapping of column names for school name/branch (if different from default)
+    #     :param force_regeocode: If True, re-geocode all address columns even if they already have lat/lon values
+
+    #     For each CSV file, calls process_file with the given parameters and logs any exceptions that occur.
+
+    #     Returns None.
+    #     """
+
+    #     # Pick up .csv and .xlsx files
+    #     files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in [".csv", ".xlsx", ".xls"]])
+    #     self.log.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
+    #     if not files:
+    #         self.log.warning("No CSV or Excel files found in raw dir.")
+    #         return
+
+    #     for f in files:
+    #         self.log.info(f"--- Processing file: {f.name} ---")
+    #         try:
+    #             if f.suffix.lower() == ".csv":
+    #                 df = pd.read_csv(f, dtype=str)
+    #             elif f.suffix.lower() == ".xlsx":
+    #                 # ensure openpyxl installed; specify engine
+    #                 df = pd.read_excel(f, dtype=str, engine="openpyxl")
+    #             elif f.suffix.lower() == ".xls":
+    #                 df = pd.read_excel(f, dtype=str, engine="xlrd")
+    #             else:
+    #                 self.log.warning(f"Skipping unsupported file type: {f.name}")
+    #                 continue
+
+    #             # ensure temporary CSV file (same stem) is created and used for processing
+    #             tmp_csv = (self.raw_dir / f"{f.stem}.tmp.csv")
+    #             df.to_csv(tmp_csv, index=False)
+    #             self.log.info(f"  wrote temporary CSV for processing: {tmp_csv.name}")
+
+    #             # call process_file on the tmp csv
+    #             self.process_file(tmp_csv, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
+
+    #             # remove tmp csv after processing
+    #             try:
+    #                 tmp_csv.unlink()
+    #             except Exception:
+    #                 pass
+
+    #         except Exception as e:
+    #             raise CustomException(f"Failed processing {f.name}: {e}")
+    #             self.log.error(f"Failed processing {f.name}: {e}")
+    #     self.log.info("Done processing all files.")
+
+
+    def process_all_files(self, school_columns_map: Optional[Dict[str, str]] = None, force_regeocode: bool = False):
         """
-        Process all CSV files in the raw data directory.
-
-        :param school_columns_map: Optional mapping of column names for school name/branch (if different from default)
-        :param force_regeocode: If True, re-geocode all address columns even if they already have lat/lon values
-
-        For each CSV file, calls process_file with the given parameters and logs any exceptions that occur.
-
-        Returns None.
+        Process all CSV/XLSX/XLS files from the raw directory.
+        Converts Excel to a unique temporary CSV in the system temp folder to avoid
+        name collisions or double .tmp suffixes, then calls process_file on that temp CSV.
         """
+        supported_exts = {".csv", ".xlsx", ".xls"}
+        files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in supported_exts])
 
-        # Pick up .csv and .xlsx files
-        files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in [".csv", ".xlsx", ".xls"]])
-        self.log.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
+        logging.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
         if not files:
-            self.log.warning("No CSV or Excel files found in raw dir.")
+            logging.warning("No CSV or Excel files found in raw dir.")
             return
 
         for f in files:
-            self.log.info(f"--- Processing file: {f.name} ---")
+            logging.info(f"--- Processing file: {f.name} ---")
+            tmp_csv_path = None
             try:
+                # Read original file into dataframe (explicit engines for Excel)
                 if f.suffix.lower() == ".csv":
                     df = pd.read_csv(f, dtype=str)
+                    # we can use the original csv directly (no tmp created)
+                    tmp_csv_path = f
                 elif f.suffix.lower() == ".xlsx":
-                    # ensure openpyxl installed; specify engine
                     df = pd.read_excel(f, dtype=str, engine="openpyxl")
                 elif f.suffix.lower() == ".xls":
                     df = pd.read_excel(f, dtype=str, engine="xlrd")
                 else:
-                    self.log.warning(f"Skipping unsupported file type: {f.name}")
+                    logging.warning(f"Skipping unsupported file type: {f.name}")
                     continue
 
-                # ensure temporary CSV file (same stem) is created and used for processing
-                tmp_csv = (self.raw_dir / f"{f.stem}.tmp.csv")
-                df.to_csv(tmp_csv, index=False)
-                self.log.info(f"  wrote temporary CSV for processing: {tmp_csv.name}")
+                # If original file was not a CSV, write a unique temp CSV in system temp dir
+                if f.suffix.lower() != ".csv":
+                    tmp_dir = Path(tempfile.gettempdir())
+                    # unique filename: originalstem + uuid4 + timestamp
+                    unique_name = f"{f.stem}_{uuid.uuid4().hex[:8]}_{int(time.time())}.tmp.csv"
+                    tmp_csv_path = tmp_dir / unique_name
+                    df.to_csv(tmp_csv_path, index=False)
+                    logging.info(f"Saved temporary CSV for processing: {tmp_csv_path}")
 
-                # call process_file on the tmp csv
-                self.process_file(tmp_csv, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
-
-                # remove tmp csv after processing
-                try:
-                    tmp_csv.unlink()
-                except Exception:
-                    pass
+                # Now call process_file on a concrete csv path (tmp_csv_path points to a real file)
+                self.process_file(Path(tmp_csv_path), school_columns_map=school_columns_map, force_regeocode=force_regeocode)
 
             except Exception as e:
-                raise CustomException(f"Failed processing {f.name}: {e}")
-                self.log.error(f"Failed processing {f.name}: {e}")
-        self.log.info("Done processing all files.")
+                logging.exception(f"Failed processing {f.name}: {e}")
 
+            finally:
+                # cleanup temporary CSV if we created one in tempdir
+                try:
+                    # only remove if tmp file is in the system temp dir (and not the original csv)
+                    if tmp_csv_path and tmp_csv_path.exists() and tmp_csv_path.parent == Path(tempfile.gettempdir()):
+                        tmp_csv_path.unlink()
+                        logging.debug(f"Removed temp file: {tmp_csv_path}")
+                except Exception as e:
+                    logging.debug(f"Failed to remove temp file {tmp_csv_path}: {e}")
+
+        logging.info("Done processing all files.")
 
 
 # ---------- CLI ----------
@@ -427,4 +489,4 @@ if __name__ == "__main__":
     # Optional: provide mapping if your files use different column names for school name/branch
     # Example: {"school_name": "school_name", "school_branch": "school_branch"}
     school_map = {"School Name": "school_name", "School Branch": "school_branch"}
-    cleaner.process_all_csvs(school_columns_map=school_map, force_regeocode=False)
+    cleaner.process_all_files(school_columns_map=school_map, force_regeocode=False)
