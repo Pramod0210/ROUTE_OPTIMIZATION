@@ -101,56 +101,137 @@ class GeocodeCleaner:
         return cols
 
     # ---------- Geocode with caching ----------
-    def geocode_with_cache(self, query: str) -> Optional[Dict[str, Any]]:
-        """
-        Geocode a query using the cache, Google Maps (if available) and Nominatim as a fallback.
+    # def geocode_with_cache(self, query: str) -> Optional[Dict[str, Any]]:
+    #     """
+    #     Geocode a query using the cache, Google Maps (if available) and Nominatim as a fallback.
 
-        :param query: query to geocode
-        :return: dict with lat, lon and provider (or None if failed)
-        """
+    #     :param query: query to geocode
+    #     :return: dict with lat, lon and provider (or None if failed)
+    #     """
 
+    #     if not isinstance(query, str) or not query.strip():
+    #         return None
+    #     key = query.strip().lower()
+    #     if key in self.cache:
+    #         return self.cache[key]
+    #     # try google first if available
+    #     result = None
+    #     if self.use_google and self.gmaps_client:
+    #         try:
+    #             res = self.gmaps_client.geocode(key)
+    #             if res:
+    #                 loc = res[0]["geometry"]["location"]
+    #                 # self.log.info(f"Google geocode result for {key}: {loc}")
+    #                 result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google"}
+    #             # self.log.info(f"Google geocode result completed")
+    #         except Exception as e:
+    #             # self.log.warning(f"Google geocode error for {key}: {e}")
+    #             result = None
+    #             raise CustomException(f"Google geocode error for {key}: {e}")
+    #     # fallback to nominatim
+    #     if result is None:
+    #         for attempt in range(self.max_retries):
+    #             try:
+    #                 # RateLimiter is used; call nom_rate_limiter
+    #                 loc = self.nom_rate_limiter(key)
+    #                 if loc:
+    #                     result = {"lat": float(loc.latitude), "lon": float(loc.longitude), "provider": "nominatim"}
+    #                 # self.log.info(f"Nominatim geocode completed")
+    #                 break
+    #             except GeopyError as ge:
+    #                 # self.log.info(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
+    #                 time.sleep(1 + attempt * 2)
+    #                 continue
+
+    #     # store in cache (even negative result)
+    #     if result is None:
+    #         self.cache[key] = {"lat": None, "lon": None, "provider": None}
+    #     else:
+    #         self.cache[key] = result
+    #     # polite sleep
+    #     time.sleep(self.sleep_between_calls)
+    #     return self.cache[key]
+    
+    def geocode_with_cache(self, query: str, hint_city: Optional[str] = None) -> Optional[Dict[str, Any]]:
+        """
+        Geocode a query using cache + multiple fallbacks.
+        If hint_city provided, try variants with the city appended.
+        """
         if not isinstance(query, str) or not query.strip():
             return None
         key = query.strip().lower()
         if key in self.cache:
             return self.cache[key]
-        # try google first if available
+
+        tried = []
+        variants = [query.strip()]
+        # normalized variant (remove punctuation)
+        import re
+        norm = re.sub(r"[^\w\s]", " ", query).strip()
+        if norm and norm not in variants:
+            variants.append(norm)
+        # append hint_city variants
+        if hint_city:
+            hc = hint_city.strip()
+            v1 = f"{query.strip()}, {hc}"
+            v2 = f"{norm}, {hc}"
+            for v in (v1, v2):
+                if v not in variants:
+                    variants.append(v)
+        # try Google Geocode (if available), then Google Places, then Nominatim
         result = None
         if self.use_google and self.gmaps_client:
-            try:
-                res = self.gmaps_client.geocode(key)
-                if res:
-                    loc = res[0]["geometry"]["location"]
-                    # self.log.info(f"Google geocode result for {key}: {loc}")
-                    result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google"}
-                # self.log.info(f"Google geocode result completed")
-            except Exception as e:
-                # self.log.warning(f"Google geocode error for {key}: {e}")
-                result = None
-                raise CustomException(f"Google geocode error for {key}: {e}")
-        # fallback to nominatim
-        if result is None:
-            for attempt in range(self.max_retries):
+            for q in variants:
+                tried.append(("google_geocode", q))
                 try:
-                    # RateLimiter is used; call nom_rate_limiter
-                    loc = self.nom_rate_limiter(key)
+                    res = self.gmaps_client.geocode(q)
+                    if res:
+                        loc = res[0]["geometry"]["location"]
+                        result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google_geocode"}
+                        break
+                except Exception as e:
+                    logging.debug(f"Google geocode error for '{q}': {e}")
+            # try Places if geocode failed
+            if result is None:
+                for q in variants:
+                    tried.append(("google_places", q))
+                    try:
+                        places_res = self.gmaps_client.places(query=q)
+                        if places_res and places_res.get("results"):
+                            place = places_res["results"][0]
+                            loc = place["geometry"]["location"]
+                            result = {"lat": float(loc["lat"]), "lon": float(loc["lng"]), "provider": "google_places"}
+                            break
+                    except Exception as e:
+                        logging.debug(f"Google places error for '{q}': {e}")
+
+        # fallback to Nominatim
+        if result is None:
+            for q in variants:
+                tried.append(("nominatim", q))
+                try:
+                    loc = self.nom_rate_limiter(q)
                     if loc:
                         result = {"lat": float(loc.latitude), "lon": float(loc.longitude), "provider": "nominatim"}
-                    # self.log.info(f"Nominatim geocode completed")
-                    break
-                except GeopyError as ge:
-                    # self.log.info(f"Nominatim error (attempt {attempt+1}) for {key}: {ge}")
-                    time.sleep(1 + attempt * 2)
-                    continue
+                        break
+                except Exception as e:
+                    logging.debug(f"Nominatim error for '{q}': {e}")
 
-        # store in cache (even negative result)
+        # store result in cache (even negative)
         if result is None:
-            self.cache[key] = {"lat": None, "lon": None, "provider": None}
+            self.cache[key] = {"lat": None, "lon": None, "provider": None, "tried": tried}
         else:
-            self.cache[key] = result
-        # polite sleep
-        time.sleep(self.sleep_between_calls)
+            self.cache[key] = {"lat": result["lat"], "lon": result["lon"], "provider": result["provider"], "tried": tried}
+
+        try:
+            from utils.cache_loader import save_cache
+            save_cache(self.cache)
+        except Exception as e:
+            logging.debug(f"Failed to save cache: {e}")
+
+        logging.debug(f"Geocode attempts for '{query}': {tried}; result: {self.cache[key]}")
         return self.cache[key]
+
 
     # ---------- City validation ----------
     def _load_school_centers(self) -> Dict[str, Dict[str, Any]]:
@@ -190,12 +271,18 @@ class GeocodeCleaner:
         df.rename(columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
         centers = {}
         for _, r in df.iterrows():
-            key = f"{r.get('school_name','').strip().lower()}__{r.get('school_branch','').strip().lower()}"
-            lat = safe_float(r.get("schoollat") or r.get("school_lat") or r.get("school_latitude"))
-            lon = safe_float(r.get("schoollon") or r.get("school_lon") or r.get("school_longitude"))
-            location_text = r.get("school_location", "")
-            centers[key] = {"lat": lat, "lon": lon, "location": location_text}
-        self.log.info(f"Loaded {len(centers)} school centers from {p}")
+            sname = str(r.get("school_name", "")).strip().lower()
+            sbranch = str(r.get("school_branch", "")).strip().lower()
+            if not sname:
+                continue
+            key = f"{sname}__{sbranch}"
+            # pick location text from 'school_location' (or other fallback columns)
+            location_text = r.get("school_location", "") or r.get("location", "") or ""
+            lat = safe_float(r.get("school_lat") or r.get("schoollat") or r.get("school_latitude"))
+            lon = safe_float(r.get("school_lon") or r.get("schoollon") or r.get("school_longitude"))
+            centers[key] = {"lat": lat, "lon": lon, "location": location_text.strip()}
+        self._school_centers = centers
+        logging.info(f"Loaded {len(centers)} school centers for city-hinting.")
         return centers
 
     def _is_within_school_area(self, school_key: str, lat: float, lon: float) -> bool:
@@ -302,7 +389,25 @@ class GeocodeCleaner:
             self.log.info(f"Geocoding {len(unique_addrs)} unique addresses for column '{col}'")
 
             for addr in tqdm(unique_addrs, desc=f"Geocoding {file_path.name}:{col}", leave=False):
-                res = self.geocode_with_cache(addr)
+                # res = self.geocode_with_cache(addr)
+
+                # Determine per-row school key
+                per_row_school_key = None
+                if school_columns_map and school_columns_map.get("school_name") in df.columns:
+                    sname_r = str(df.at[i, school_columns_map.get("school_name")]).strip().lower()
+                    sbranch_r = str(df.at[i, school_columns_map.get("school_branch")]).strip().lower()
+                    per_row_school_key = f"{sname_r}__{sbranch_r}"
+                # get hint_city from loaded centers
+                hint_city = None
+                if getattr(self, "_school_centers", None) is None:
+                    self._load_school_centers()
+                center = self._school_centers.get(per_row_school_key) if per_row_school_key else None
+                if center and center.get("location"):
+                    hint_city = center["location"]
+
+                # finally call geocoding with hint
+                res = self.geocode_with_cache(addr, hint_city=hint_city)
+
                 # apply to all rows with this addr
                 idxs = df.index[df[col] == addr].tolist()
                 if res and res.get("lat") is not None:
@@ -370,58 +475,6 @@ class GeocodeCleaner:
         save_cache(self.cache)
         return out_path
 
-    # ---------- Batch processing ----------
-    # def process_all_csvs(self, school_columns_map: Optional[Dict[str,str]] = None, force_regeocode: bool = False):
-    #     """
-    #     Process all CSV files in the raw data directory.
-
-    #     :param school_columns_map: Optional mapping of column names for school name/branch (if different from default)
-    #     :param force_regeocode: If True, re-geocode all address columns even if they already have lat/lon values
-
-    #     For each CSV file, calls process_file with the given parameters and logs any exceptions that occur.
-
-    #     Returns None.
-    #     """
-
-    #     # Pick up .csv and .xlsx files
-    #     files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in [".csv", ".xlsx", ".xls"]])
-    #     self.log.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
-    #     if not files:
-    #         self.log.warning("No CSV or Excel files found in raw dir.")
-    #         return
-
-    #     for f in files:
-    #         self.log.info(f"--- Processing file: {f.name} ---")
-    #         try:
-    #             if f.suffix.lower() == ".csv":
-    #                 df = pd.read_csv(f, dtype=str)
-    #             elif f.suffix.lower() == ".xlsx":
-    #                 # ensure openpyxl installed; specify engine
-    #                 df = pd.read_excel(f, dtype=str, engine="openpyxl")
-    #             elif f.suffix.lower() == ".xls":
-    #                 df = pd.read_excel(f, dtype=str, engine="xlrd")
-    #             else:
-    #                 self.log.warning(f"Skipping unsupported file type: {f.name}")
-    #                 continue
-
-    #             # ensure temporary CSV file (same stem) is created and used for processing
-    #             tmp_csv = (self.raw_dir / f"{f.stem}.tmp.csv")
-    #             df.to_csv(tmp_csv, index=False)
-    #             self.log.info(f"  wrote temporary CSV for processing: {tmp_csv.name}")
-
-    #             # call process_file on the tmp csv
-    #             self.process_file(tmp_csv, school_columns_map=school_columns_map, force_regeocode=force_regeocode)
-
-    #             # remove tmp csv after processing
-    #             try:
-    #                 tmp_csv.unlink()
-    #             except Exception:
-    #                 pass
-
-    #         except Exception as e:
-    #             raise CustomException(f"Failed processing {f.name}: {e}")
-    #             self.log.error(f"Failed processing {f.name}: {e}")
-    #     self.log.info("Done processing all files.")
 
 
     def process_all_files(self, school_columns_map: Optional[Dict[str, str]] = None, force_regeocode: bool = False):
