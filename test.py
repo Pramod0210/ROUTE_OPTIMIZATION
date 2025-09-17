@@ -1,337 +1,252 @@
-from __future__ import annotations
-import os
-import sys
-from pathlib import Path
-import uuid
-from datetime import datetime
-import json
-import shutil
-from typing import List, Iterable, Optional, Dict, Any
-import hashlib
+def process_file(self,
+                 csv_path: Path,
+                 school_columns_map: Optional[Dict[str, str]] = None,
+                 force_regeocode: bool = False,
+                 original_raw_file: Optional[Path] = None) -> pd.DataFrame:
+    """
+    Process a single CSV (csv_path) and return the processed DataFrame.
+    Responsibilities:
+      - normalize column names (snake_case)
+      - lowercase text columns
+      - detect address-like columns and ensure <col>_lat / <col>_lon exist
+      - geocode missing coordinates using self.geocode_with_cache (if present)
+      - validate geocodes against school area using self._is_within_school_area()
+      - set <col>_geocode_flag for problematic rows ("geocode_failed", "out_of_radius:NN.NNkm")
+      - collect file-level issues to logs/<file>_geocode_issues.csv
+    Notes:
+      - relies on self.cfg for lat/lon suffixes and validation.max_city_radius_km
+      - will call save_cache() from utils.cache_loader if available
+    """
+    import math
+    from pathlib import Path
+    import pandas as pd
 
-import fitz
-from langchain.schema import Document
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, TextLoader
-from langchain_community.vectorstores import FAISS
-from langchain_core.output_parsers import StrOutputParser
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+    self.log.info(f"Processing CSV: {csv_path}")
 
-from utils.model_loader import ModelLoader
-from utils.file_io import _session_id, save_uploaded_files
-from utils.document_ops import load_documents, concat_for_analysis, concact_for_comparison
+    # read CSV
+    df = pd.read_csv(csv_path, dtype=str).fillna("")
 
-from logger.custom_logger import CustomLogger
-from exception.custom_exception import CustomException
+    # normalize column names
+    df.rename(columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
 
-SUPPORTED_EXTENSIONS = {".pdf", ".docx", ".md", ".ppt", ".txt"}
+    # lowercase textual columns (safe)
+    for col in df.columns:
+        if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+            df[col] = df[col].astype(str).str.strip().str.lower()
 
-class FaissManager:
-    def __init__(self, index_dir: Path, model_loader: Optional[ModelLoader] = None):
+    # address keyword heuristics from config
+    addr_keywords_cfg = self.cfg.get("address_keywords", ["address", "pickup", "drop", "location", "parking", "society", "stop", "depot"])
+    # normalize keywords for matching (replace spaces with underscore)
+    addr_keywords = [k.strip().lower().replace(" ", "_") for k in addr_keywords_cfg]
+
+    lat_suffix = self.cfg.get("lat_suffix", "_lat")
+    lon_suffix = self.cfg.get("lon_suffix", "_lon")
+
+    # detect candidate address columns
+    address_cols = [c for c in df.columns if any(k in c for k in addr_keywords)]
+    self.log.info(f"Detected address-like columns: {address_cols}")
+
+    # ensure school centers loaded for proximity checks
+    if getattr(self, "_school_centers", None) is None:
         try:
-            self.log = CustomLogger().get_logger(__name__)
-            self.index_dir = Path(index_dir)
-            self.index_dir.mkdir(parents=True, exist_ok=True)
+            self._load_school_centers()
+        except Exception as e:
+            self.log.debug(f"_load_school_centers() failed: {e}")
+            self._school_centers = {}
 
-            self.meta_path = self.index_dir / "ingested_meta.json"
-            self._meta = {"rows":{}}
+    # prepare cache utilities if available
+    try:
+        from utils.cache_loader import load_cache, save_cache
+        cache = load_cache()
+    except Exception:
+        cache = {}
+        save_cache = None
 
-            if self.meta_path.exists():
+    # geocode availability
+    do_geocode = hasattr(self, "geocode_with_cache") and callable(getattr(self, "geocode_with_cache"))
+
+    # prepare per-file issues list
+    file_issues = []
+
+
+    # validation radius (km)
+    max_radius_km = float(self.cfg.get("validation", {}).get("max_city_radius_km", 50.0))
+
+    # For each address-like column: ensure lat/lon exist and geocode missing
+    for col in address_cols:
+        lat_col = f"{col}{lat_suffix}"
+        lon_col = f"{col}{lon_suffix}"
+        flag_col = f"{col}_geocode_flag"
+
+        if lat_col not in df.columns:
+            df[lat_col] = ""
+        if lon_col not in df.columns:
+            df[lon_col] = ""
+        if flag_col not in df.columns:
+            df[flag_col] = ""
+
+        # convert lat/lon columns to numeric where present
+        df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+        df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+
+        # rows that need geocoding (missing coords) or force_regeocode
+        mask_need = (df[lat_col].isna() | df[lon_col].isna()) if not force_regeocode else pd.Series([True] * len(df), index=df.index)
+        mask_need = mask_need & df[col].astype(bool)
+
+        unique_addrs = df.loc[mask_need, col].dropna().unique().tolist()
+        self.log.info(f"{len(unique_addrs)} unique addresses to geocode for column '{col}'")
+
+        for addr in unique_addrs:
+            # sample rows for this address
+            idxs = df.index[df[col] == addr].tolist()
+            sample_idx = idxs[0] if idxs else None
+
+            # determine per-row school key & hint_city (if school_columns_map provided)
+            per_row_school_key = None
+            hint_city = None
+            if sample_idx is not None and school_columns_map:
                 try:
-                    self._meta = json.loads(self.meta_path.read_text(encoding="utf-8")) or {"rows":{}}
+                    sname_col = school_columns_map.get("school_name")
+                    sbranch_col = school_columns_map.get("school_branch")
+                    if sname_col in df.columns and sbranch_col in df.columns:
+                        sname = str(df.at[sample_idx, sname_col]).strip().lower()
+                        sbranch = str(df.at[sample_idx, sbranch_col]).strip().lower()
+                        if sname:
+                            per_row_school_key = f"{sname}__{sbranch}"
+                            center = getattr(self, "_school_centers", {}).get(per_row_school_key)
+                            if center and center.get("location"):
+                                hint_city = center["location"]
                 except Exception:
-                    self._meta = {"rows":{}}
+                    per_row_school_key = None
+                    hint_city = None
 
-            self.model_loader = model_loader or ModelLoader()
-            self.emb = self.model_loader.load_embeddings()
-            self.vs: Optional[FAISS] = None
+            # call geocode (try to pass hint_city if supported)
+            res = None
+            if do_geocode:
+                try:
+                    # prefer hint_city-aware call
+                    try:
+                        res = self.geocode_with_cache(addr, hint_city=hint_city)
+                    except TypeError:
+                        res = self.geocode_with_cache(addr)
+                except Exception as e:
+                    self.log.debug(f"geocode_with_cache exception for '{addr}': {e}")
+                    res = None
 
-            self.log.info(f"Initialized FaissManager with index directory: {self.index_dir}")
+            # apply or flag results
+            if res and res.get("lat") is not None:
+                lat_val = float(res["lat"])
+                lon_val = float(res["lon"])
 
-        except Exception as e:
-            self.log.error(f"Error initializing FaissManager: {str(e)}")
-            raise CustomException(f"Failed to initialize FaissManager:", e) from e
-    
-    def _exists(self):
-        try:
-            return (self.index_dir / "index.faiss").exists() and (self.index_dir / "index.index").exists()
-            self.log.info("FaissManager exists.")
-        except Exception as e:
-            self.log.error(f"Error checking if FaissManager exists: {str(e)}")
-            raise CustomException(f"Failed to check if FaissManager exists:", e) from e
-    
-    @staticmethod
-    def _fingerprint(text:str, md:Dict[str, Any]):
-        src = md.get("source") or md.get("file_path")
-        rid = md.get("row_id")
-        if src is not None:
-            return f"{src}::{'' if rid is None else rid}"
-        
-        return hashlib.sha256(text.encode("utf-8")).hexdigest()
-        pass
-    
-    def _save_metadata(self):
-        try:
-            return self.meta_path.write_text(json.dumps(self._meta, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            self.log.error(f"Error saving metadata: {str(e)}")
-            raise CustomException(f"Failed to save metadata: {str(e)}", sys)
-        
-    def add_documents(self, docs: List[Document]):
-        try:
-            if self.vs is None:
-                raise RuntimeError("FaissManager is not initialized.")
-            
-            new_docs: List[Document] = []
-            for d in docs:
-                fp = self._fingerprint(d.page_content, d.metadata or {})
-                if fp in self._meta["rows"]:
-                    continue
-                self._meta["rows"][fp] = True
-                new_docs.append(d)
-            
-            if new_docs:
-                self.vs.add_documents(new_docs)
-                self.vs.save_local(self.index_dir)
-                self._save_metadata()
-            self.log.info(f"Added {len(new_docs)} new documents.")
-            
-            return len(new_docs)
+                # proximity check against school center if available
+                too_far = False
+                dist_km = None
+                if per_row_school_key:
+                    center = getattr(self, "_school_centers", {}).get(per_row_school_key)
+                    if center and center.get("lat") is not None and center.get("lon") is not None:
+                        dist_m = _haversine_m(center["lat"], center["lon"], lat_val, lon_val)
+                        if dist_m is not None:
+                            dist_km = dist_m / 1000.0
+                            if dist_km > max_radius_km:
+                                too_far = True
 
-        except Exception as e:
-            self.log.error(f"Error adding documents: {str(e)}")
-            raise CustomException(f"Failed to add documents: {str(e)}", e) from e
-    
-    def load_or_create(self, texts:Optional[List[str]]=None, metadata: Optional[List[dict]]=None):
-        try:
-            if self._exists():
-                self.vs = FAISS.load_local(str(self.index_dir), embeddings =self.emb, allow_dangerous_deserialization=True)
-                self.log.info("Loaded existing FaissManager.")
-                return self.vs
-            
-            if not texts:
-                raise CustomException("No texts provided to create FaissManager.", e)
-            self.vs = FAISS.from_texts(texts=texts, embedding=self.emb, metadatas=metadata or [] )
-            self.vs.save_local(self.index_dir)
+                # if too far and we have a hint_city, try retry with appended hint
+                if too_far and hint_city:
+                    appended = f"{addr}, {hint_city}"
+                    try:
+                        try:
+                            retry_res = self.geocode_with_cache(appended, hint_city=hint_city)
+                        except TypeError:
+                            retry_res = self.geocode_with_cache(appended)
+                        if retry_res and retry_res.get("lat") is not None:
+                            lat_val = float(retry_res["lat"])
+                            lon_val = float(retry_res["lon"])
+                            # recompute distance
+                            if per_row_school_key and center and center.get("lat") is not None:
+                                dist_m2 = _haversine_m(center["lat"], center["lon"], lat_val, lon_val)
+                                dist_km2 = (dist_m2 / 1000.0) if dist_m2 is not None else None
+                                if dist_km2 is not None and dist_km2 <= max_radius_km:
+                                    too_far = False
+                                    dist_km = dist_km2
+                                else:
+                                    too_far = True
+                                    dist_km = dist_km2
+                            else:
+                                # accept retry if no center to compare
+                                too_far = False
+                                dist_km = None
+                            # update cache variable (if used)
+                            res = retry_res
+                    except Exception as e:
+                        self.log.debug(f"Retry geocode exception for '{addr}': {e}")
 
-            self.log.info("Loaded or created new FaissManager.")
-            return self.vs
-        
-        except Exception as e:
-            self.log.error(f"Error loading or creating FaissManager: {str(e)}")
-            raise CustomException(f"Failed to load or create FaissManager:", e) from e
-
-
-class ChatIngestor:
-    def __init__(self,
-                 temp_base ="data/data_chat",
-                 faiss_base = "faiss_index",
-                 use_session_dirs = True,
-                 session_id = None):
-        try:
-            self.log = CustomLogger().get_logger(__name__)
-            self.model_loader = ModelLoader()
-            self.use_session = use_session_dirs
-            self.session_id = session_id or _session_id()
-            self.temp_base = Path(temp_base)
-            self.temp_base.mkdir(parents=True, exist_ok=True)
-            self.faiss_base = Path(faiss_base)
-            self.faiss_base.mkdir(parents=True, exist_ok=True)
-
-            self.temp_dir = self._resolve_dir(self.temp_base)
-            self.faiss_dir = self._resolve_dir(self.faiss_base)
-            self.log.info(f"ChatIngestor initialized with session ID: {self.session_id} and data directory: {self.temp_dir}")
-
-        except Exception as e:
-            self.log.error(f"Error initializing ChatIngestor: {str(e)}")
-            raise CustomException(f"Failed to initialize ChatIngestor:", e) from e
-    
-    def _resolve_dir(self, base):
-        try:
-            if self.use_session:
-                d = base/self.session_id
-                d.mkdir(parents=True, exist_ok=True)
-                return d
-            return base
-        except Exception as e:
-            self.log.error(f"Error resolving directory: {str(e)}")
-            raise CustomException(f"Failed to resolve directory: {str(e)}", sys)
-    
-    def _split(self, docs, chunk_size=1000, chunk_overlap=200):
-        try:
-            splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            chunks = splitter.split_documents(docs)
-            self.log.info(f"Created splitter with {len(chunks)} chunks")
-            return chunks
-        except Exception as e:
-            self.log.error(f"Error splitting: {str(e)}")
-            raise CustomException(f"Failed to split:", e) from e
-    
-    def built_retriever(self,
-                        uploaded_files, 
-                        *,
-                        chunk_size=1000, 
-                        chunk_overlap=200,
-                        k=5):
-        try:
-            paths = save_uploaded_files(uploaded_files, self.temp_dir)
-            docs = load_documents(paths)
-            if not docs:
-                raise ValueError("No documents found in uploaded files.")
-            
-            chunks = self._split(docs, chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-            fm = FaissManager(self.faiss_dir, self.model_loader)
-            texts = [doc.page_content for doc in chunks]
-            metas = [doc.metadata for doc in chunks]
-            try:
-                vs = fm.load_or_create(texts=texts, metadata=metas)
-            except Exception:
-                vs = fm.load_or_create(texts=texts, metadata=metas)
-            
-            added = fm.add_documents(chunks)
-            self.log.info(f"Added {added} new documents to FaissManager.")
-            return vs.as_retriever(search_type="similarity", search_kwargs={"k": k})
-        except Exception as e:
-            self.log.error(f"Error building retriever: {str(e)}")
-            raise CustomException(f"Failed to build retriever:", e) from e
-        
-
-class DocumentHandler:
-    def __init__(self, data_dir=None, session_id=None):
-        try:
-            self.log = CustomLogger().get_logger(__name__)
-            self.data_dir = data_dir or os.getenv(
-                "DATA_STORAGE_PATH", 
-                os.path.join(os.getcwd(), "data", "data_analysis")
-            )
-            self.session_id = session_id or _session_id("session")
-            self.session_path = os.path.join(self.data_dir, self.session_id)
-            os.makedirs(self.session_path, exist_ok=True)
-            self.log.info(f"DocumentHandler initialized with session ID: {self.session_id} and data directory: {self.data_dir}")
-        except Exception as e:
-            self.log.error(f"Error initializing DocumentHandler: {str(e)}")
-            raise CustomException(f"Failed to initialize DocumentHandler: ", e) from e
-
-    def save_pdf(self, uploaded_file_name):
-        try:
-            filename = os.path.basename(uploaded_file_name.name)
-
-            if not filename.lower().endswith('.pdf'):
-                self.log.error("Uploaded file is not a PDF.")
-                raise ValueError("Uploaded file is not a PDF.")
-            
-            save_path = os.path.join(self.session_path, filename)
-            with open(save_path, "wb") as f:
-                if hasattr(uploaded_file_name, "read"):
-                    f.write(uploaded_file_name.read())
+                # Final apply or flag
+                if not too_far:
+                    for i in idxs:
+                        # do not overwrite existing coords unless force_regeocode
+                        if not force_regeocode and not pd.isna(df.at[i, lat_col]) and not pd.isna(df.at[i, lon_col]):
+                            continue
+                        df.at[i, lat_col] = lat_val
+                        df.at[i, lon_col] = lon_val
+                        df.at[i, flag_col] = ""  # clear flag
                 else:
-                    f.write(uploaded_file_name.getbuffer())
-            
-            self.log.info(f"PDF saved", filename=filename, save_path= save_path, session_id=self.session_id)
-            return save_path
-        
-        except Exception as e:
-            self.log.error(f"Error saving PDF: {str(e)}", session_id=self.session_id)
-            raise CustomException(f"Failed to save PDF:", e) from e
+                    # mark as out_of_radius and record issue
+                    for i in idxs:
+                        # optionally still write the geocoded coords but flag them
+                        df.at[i, lat_col] = lat_val
+                        df.at[i, lon_col] = lon_val
+                        flag_msg = f"out_of_radius:{dist_km:.2f}km" if dist_km is not None else "out_of_radius"
+                        df.at[i, flag_col] = flag_msg
+                        file_issues.append({
+                            "file": Path(csv_path).name,
+                            "row_index": int(i),
+                            "address_col": col,
+                            "address": addr,
+                            "geocoded_lat": lat_val,
+                            "geocoded_lon": lon_val,
+                            "issue": "out_of_radius",
+                            "distance_km": dist_km
+                        })
+                        self.log.warning(f"Geocode out_of_radius file={Path(csv_path).name} row={i} addr='{addr}' dist_km={dist_km}")
+            else:
+                # geocode failed - flag all matching rows
+                for i in idxs:
+                    df.at[i, flag_col] = "geocode_failed"
+                    file_issues.append({
+                        "file": Path(csv_path).name,
+                        "row_index": int(i),
+                        "address_col": col,
+                        "address": addr,
+                        "issue": "geocode_failed"
+                    })
+                    self.log.debug(f"Geocode failed for file={Path(csv_path).name} row={i} addr='{addr}'")
 
-    def read_pdf(self, pdf_path):
+        # end for each unique addr
+
+        # save cache if updated
         try:
-            text_chunks = []
-            with fitz.open(pdf_path) as doc:
-                for page_num in range(doc.page_count):
-                    page = doc.load_page(page_num)
-                    text_chunks.append(f"\n--- Page {page_num+1} ---\n{page.get_text()}")
-            text = "\n".join(text_chunks)
-            self.log.info(f"PDF read successfully", pdf_path=pdf_path, num_pages=len(text_chunks))
-            return text
+            if save_cache is not None:
+                save_cache(cache)
         except Exception as e:
-            self.log.error(f"Error reading PDF: {str(e)}", pdf_path=pdf_path, session_id=self.session_id)
-            raise CustomException(f"Failed to read PDF: ", e) from e
-    
+            self.log.debug(f"save_cache failed: {e}")
 
-class DocumentComparator:
-    def __init__(self, base_dir="data/data_compare", session_id=None):
-        self.log = CustomLogger().get_logger(__name__)
-        self.base_dir = Path(base_dir)
-        # self.base_dir.mkdir(parents=True, exist_ok=True)
-        self.session_id = session_id or _session_id()
-        self.session_path = self.base_dir / self.session_id
-        self.session_path.mkdir(parents=True, exist_ok=True)
-        self.log.info(f"DocumentIngestion initialized with session ID: {self.session_id} and data directory: {self.session_path}")
+    # end for each address column
 
-    def save_uploaded_file(self, reference_file, actual_file):
-        try:
-            # self.delete_exisiting_files()
-            self.log.info("Existing file deleted successfully")
+    # write file_issues if any
+    try:
+        if file_issues:
+            issues_df = pd.DataFrame(file_issues)
+            logs_dir = Path(self.cfg.get("paths", {}).get("logs", "logs"))
+            logs_dir.mkdir(parents=True, exist_ok=True)
+            out_issues = logs_dir / f"geocode_issues__{Path(csv_path).stem}.csv"
+            # append if exists to preserve previous runs
+            if out_issues.exists():
+                issues_df.to_csv(out_issues, mode="a", header=False, index=False)
+            else:
+                issues_df.to_csv(out_issues, index=False)
+            self.log.info(f"Wrote {len(file_issues)} geocode issues to {out_issues}")
+    except Exception as e:
+        self.log.debug(f"Failed to write geocode issues: {e}")
 
-            ref_path = self.session_path / reference_file.name
-            act_path = self.session_path / actual_file.name
-            for fobj, out in ((reference_file, ref_path), (actual_file, act_path)):
-                if not fobj.name.lower().endswith('.pdf'):
-                    raise ValueError("Only PDF files are allowed.")
-                with open(out, "wb") as f:
-                    if hasattr(fobj, "read"):
-                        f.write(fobj.read())
-                    else:
-                        f.write(fobj.getbuffer())
-            
-            self.log.info(f"Files saved successfully", reference_file=reference_file.name, actual_file=actual_file.name)
-            return ref_path, act_path
-            
-        except Exception as e:
-            self.log.error(f"Error saving uploaded file: {str(e)}, session_id={self.session_id}")
-            raise CustomException(f"Failed to save uploaded file:", e) from e
-
-    def read_pdf(self, pdf_path):
-        try:
-            with fitz.open(pdf_path) as doc:
-                if doc.is_encrypted:
-                    raise ValueError(f"PDF is encrypted and cannot be read. {pdf_path.name}")
-                
-                all_text = []
-                for page_num in range(doc.page_count):
-                    page = doc.load_page(page_num)
-                    page_text = page.get_text()
-                    if page_text.strip():
-                        all_text.append(f"\n--- Page {page_num+1} ---\n{page_text}")
-                self.log.info(f"PDF read successfully", file=str(pdf_path), pages=len(all_text))
-
-                # all_text = "\n".join(all_text) 
-                return "\n".join(all_text) 
-            
-        except Exception as e:
-            self.log.error(f"Error reading PDF: {str(e)}")
-            raise CustomException(f"Failed to read PDF: ", e) from e
-
-    
-    def combine_documents(self):
-        try:
-            # content_dict = {}
-            doc_parts = []
-            for filename in sorted(self.session_path.iterdir()):
-                if filename.is_file() and filename.suffix.lower() == '.pdf':
-                    text = self.read_pdf(filename)
-                    # content_dict[filename.name] = text
-                    doc_parts.append(f"Document: {filename.name}\n{text}")
-                
-            # for filename, content in content_dict.items():
-            #     doc_parts.append(f"Document: {filename}\n{content}")
-            
-            combined_text = "\n\n".join(doc_parts)
-            self.log.info("Documents combined successfully.", count=len(doc_parts))
-            return combined_text
- 
-        except Exception as e:
-            self.log.error(f"Error combining documents: {str(e)}")
-            raise CustomException(f"Failed to combine documents: {str(e)}", sys)
-        
-    def clear_old_session(self, keep_latest=3):
-        try:
-            session_folder = sorted([f for f in self.base_dir.iterdir() if f.is_dir()],
-                                    reverse=True)
-            
-            for folder in session_folder[keep_latest:]:
-                shutil.rmtree(folder, ignore_errors=True)
-                self.log.info("Old sessions cleared successfully.")
-        except Exception as e:
-            self.log.error(f"Error clearing session: {str(e)}")
-            raise CustomException(f"Failed to clear session:", e) from e
+    self.log.info(f"Completed processing for {csv_path.name}")
+    return df

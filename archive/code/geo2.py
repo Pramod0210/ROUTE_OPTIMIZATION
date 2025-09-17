@@ -261,262 +261,246 @@ class GeocodeCleaner:
 
 
     def process_file(self,
-                    csv_path: Path,
-                    school_columns_map: Optional[Dict[str, str]] = None,
-                    force_regeocode: bool = False,
-                    original_raw_file: Optional[Path] = None) -> pd.DataFrame:
-        """
-        Process a single CSV (csv_path) and return the processed DataFrame.
-        Responsibilities:
-        - normalize column names (snake_case)
-        - lowercase text columns
-        - detect address-like columns and ensure <col>_lat / <col>_lon exist
-        - geocode missing coordinates using self.geocode_with_cache (if present)
-        - validate geocodes against school area using self._is_within_school_area()
-        - set <col>_geocode_flag for problematic rows ("geocode_failed", "out_of_radius:NN.NNkm")
-        - collect file-level issues to logs/<file>_geocode_issues.csv
-        Notes:
-        - relies on self.cfg for lat/lon suffixes and validation.max_city_radius_km
-        - will call save_cache() from utils.cache_loader if available
-        """
+                        csv_path: Path,
+                        school_columns_map: Optional[Dict[str, str]] = None,
+                        force_regeocode: bool = False,
+                        original_raw_file: Optional[Path] = None) -> pd.DataFrame:
+            """
+            Process a single CSV file path and return the processed dataframe.
+            - Normalizes column names to snake_case lowercase.
+            - Lowercases text columns.
+            - Detects address-like columns and, if geocoding available, geocodes missing lat/lon.
+            NOTE: This function DOES NOT write the final file; caller writes canonical file.
+            """
+            self.log.info(f"Processing CSV for normalization: {csv_path.name}")
+            # Read CSV into df (ensure encoding safe)
+            df = pd.read_csv(csv_path, dtype=str).fillna("")
 
-        self.log.info(f"Processing CSV: {csv_path}")
+            # Normalize column names to snake_case
+            normalized_cols = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
+            df.rename(columns=normalized_cols, inplace=True)
+            self.log.debug(f"Normalized columns: {list(df.columns)}")
 
-        # read CSV
-        df = pd.read_csv(csv_path, dtype=str).fillna("")
+            # Lowercase textual columns
+            for col in df.columns:
+                if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
+                    df[col] = df[col].astype(str).str.strip().str.lower()
 
-        # normalize column names
-        df.rename(columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
+            # Detect address-like columns (basic heuristic from config)
+            keywords = [k.strip().lower() for k in self.cfg.get("address_keywords", ["address", "pickup", "drop", "location", "parking", "society", "stop", "depot"])]
+            address_cols = [c for c in df.columns if any(kw.replace(" ", "_") in c or kw in c for kw in keywords)]
+            self.log.info(f"Detected address-like columns: {address_cols}")
 
-        # lowercase textual columns (safe)
-        for col in df.columns:
-            if pd.api.types.is_object_dtype(df[col]) or pd.api.types.is_string_dtype(df[col]):
-                df[col] = df[col].astype(str).str.strip().str.lower()
+            # For each address column, ensure lat/lon existence and geocode missing points if geocode available
+            lat_suffix = self.cfg.get("lat_suffix", "_lat")
+            lon_suffix = self.cfg.get("lon_suffix", "_lon")
 
-        # address keyword heuristics from config
-        addr_keywords_cfg = self.cfg.get("address_keywords", ["address", "pickup", "drop", "location", "parking", "society", "stop", "depot"])
-        # normalize keywords for matching (replace spaces with underscore)
-        addr_keywords = [k.strip().lower().replace(" ", "_") for k in addr_keywords_cfg]
+            # Prepare school hint mapping if requested: mapping school_name__school_branch -> school_location
+            school_hints = {}
+            school_master_path = Path(self.cfg.get("paths", {}).get("school_master", ""))  # may be Excel or CSV
+            if school_master_path and school_master_path.exists():
+                try:
+                    # support excel/csv for school master
+                    if school_master_path.suffix.lower() in [".xlsx", ".xls"]:
+                        sm_df = pd.read_excel(school_master_path, dtype=str, engine="openpyxl")
+                    else:
+                        sm_df = pd.read_csv(school_master_path, dtype=str)
+                    sm_df.rename(columns={c: c.strip().lower().replace(" ", "_") for c in sm_df.columns}, inplace=True)
+                    for _, r in sm_df.fillna("").iterrows():
+                        key = f"{str(r.get('school_name','')).strip().lower()}__{str(r.get('school_branch','')).strip().lower()}"
+                        # prefer school_location column if present
+                        school_hints[key] = str(r.get('school_location','')).strip()
+                except Exception as e:
+                    self.log.debug(f"Could not load school master for hints: {e}")
 
-        lat_suffix = self.cfg.get("lat_suffix", "_lat")
-        lon_suffix = self.cfg.get("lon_suffix", "_lon")
-
-        # detect candidate address columns
-        address_cols = [c for c in df.columns if any(k in c for k in addr_keywords)]
-        self.log.info(f"Detected address-like columns: {address_cols}")
-
-        # ensure school centers loaded for proximity checks
-        if getattr(self, "_school_centers", None) is None:
+            # Load cache if loader present
             try:
-                self._load_school_centers()
-            except Exception as e:
-                self.log.debug(f"_load_school_centers() failed: {e}")
-                self._school_centers = {}
+                cache = load_cache()
+            except Exception:
+                cache = {}
 
-        # prepare cache utilities if available
-        try:
-            cache = load_cache()
-        except Exception:
-            cache = {}
-            save_cache = None
+            # Simple geocode call if method exists on self
+            do_geocode = hasattr(self, "geocode_with_cache") and callable(getattr(self, "geocode_with_cache"))
 
-        # geocode availability
-        do_geocode = hasattr(self, "geocode_with_cache") and callable(getattr(self, "geocode_with_cache"))
+            for col in address_cols:
+                lat_col = f"{col}{lat_suffix}"
+                lon_col = f"{col}{lon_suffix}"
+                # ensure lat/lon columns exist
+                if lat_col not in df.columns:
+                    df[lat_col] = ""
+                if lon_col not in df.columns:
+                    df[lon_col] = ""
 
-        # prepare per-file issues list
-        file_issues = []
+                # convert to numeric where present
+                df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+                df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
 
+                # rows needing geocode
+                mask_need = df[lat_col].isna() | df[lon_col].isna() if not force_regeocode else pd.Series(True, index=df.index)
+                mask_need = mask_need & df[col].astype(bool)
 
-        # validation radius (km)
-        max_radius_km = float(self.cfg.get("validation", {}).get("max_city_radius_km", 50.0))
+                # dedupe addresses to minimize API calls
+                unique_addrs = df.loc[mask_need, col].dropna().unique().tolist()
+                self.log.info(f"{len(unique_addrs)} unique addresses to geocode for column '{col}'")
 
-        # For each address-like column: ensure lat/lon exist and geocode missing
-        for col in address_cols:
-            lat_col = f"{col}{lat_suffix}"
-            lon_col = f"{col}{lon_suffix}"
-            flag_col = f"{col}_geocode_flag"
+                for addr in unique_addrs:
+                    # determine hint city if possible (try to get school hint from row sample)
+                    hint_city = None
+                    # attempt to find a row where this addr occurs and pull school info
+                    sample_idx = df.index[df[col] == addr].tolist()
+                    if sample_idx:
+                        i = sample_idx[0]
+                        try:
+                            sname = str(df.at[i, "school_name"]).strip().lower() if "school_name" in df.columns else ""
+                            sbranch = str(df.at[i, "school_branch"]).strip().lower() if "school_branch" in df.columns else ""
+                            key = f"{sname}__{sbranch}"
+                            if key in school_hints and school_hints[key]:
+                                hint_city = school_hints[key]
+                        except Exception:
+                            hint_city = None
 
-            if lat_col not in df.columns:
-                df[lat_col] = ""
-            if lon_col not in df.columns:
-                df[lon_col] = ""
-            if flag_col not in df.columns:
-                df[flag_col] = ""
-
-            # convert lat/lon columns to numeric where present
-            df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
-            df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
-
-            # rows that need geocoding (missing coords) or force_regeocode
-            mask_need = (df[lat_col].isna() | df[lon_col].isna()) if not force_regeocode else pd.Series([True] * len(df), index=df.index)
-            mask_need = mask_need & df[col].astype(bool)
-
-            unique_addrs = df.loc[mask_need, col].dropna().unique().tolist()
-            self.log.info(f"{len(unique_addrs)} unique addresses to geocode for column '{col}'")
-
-            for addr in unique_addrs:
-                # sample rows for this address
-                idxs = df.index[df[col] == addr].tolist()
-                sample_idx = idxs[0] if idxs else None
-
-                # determine per-row school key & hint_city (if school_columns_map provided)
-                per_row_school_key = None
-                hint_city = None
-                if sample_idx is not None and school_columns_map:
-                    try:
-                        sname_col = school_columns_map.get("school_name")
-                        sbranch_col = school_columns_map.get("school_branch")
-                        if sname_col in df.columns and sbranch_col in df.columns:
-                            sname = str(df.at[sample_idx, sname_col]).strip().lower()
-                            sbranch = str(df.at[sample_idx, sbranch_col]).strip().lower()
-                            if sname:
-                                per_row_school_key = f"{sname}__{sbranch}"
-                                center = getattr(self, "_school_centers", {}).get(per_row_school_key)
-                                if center and center.get("location"):
-                                    hint_city = center["location"]
-                    except Exception:
-                        per_row_school_key = None
-                        hint_city = None
-
-                # call geocode (try to pass hint_city if supported)
-                res = None
-                if do_geocode:
-                    try:
-                        # prefer hint_city-aware call
+                    if do_geocode:
                         try:
                             res = self.geocode_with_cache(addr, hint_city=hint_city)
                         except TypeError:
+                            # backward compat: geocode_with_cache may not accept hint_city
                             res = self.geocode_with_cache(addr)
-                    except Exception as e:
-                        self.log.debug(f"geocode_with_cache exception for '{addr}': {e}")
+                    else:
+                        # No geocoder available - skip geocoding
                         res = None
 
-                # apply or flag results
-                if res and res.get("lat") is not None:
-                    lat_val = float(res["lat"])
-                    lon_val = float(res["lon"])
-
-                    # proximity check against school center if available
-                    too_far = False
-                    dist_km = None
-                    if per_row_school_key:
-                        center = getattr(self, "_school_centers", {}).get(per_row_school_key)
-                        if center and center.get("lat") is not None and center.get("lon") is not None:
-                            dist_m = haversine_km(center["lat"], center["lon"], lat_val, lon_val)
-                            if dist_m is not None:
-                                dist_km = dist_m / 1000.0
-                                if dist_km > max_radius_km:
-                                    too_far = True
-
-                    # if too far and we have a hint_city, try retry with appended hint
-                    if too_far and hint_city:
-                        appended = f"{addr}, {hint_city}"
-                        try:
-                            try:
-                                retry_res = self.geocode_with_cache(appended, hint_city=hint_city)
-                            except TypeError:
-                                retry_res = self.geocode_with_cache(appended)
-                            if retry_res and retry_res.get("lat") is not None:
-                                lat_val = float(retry_res["lat"])
-                                lon_val = float(retry_res["lon"])
-                                # recompute distance
-                                if per_row_school_key and center and center.get("lat") is not None:
-                                    dist_m2 = haversine_km(center["lat"], center["lon"], lat_val, lon_val)
-                                    dist_km2 = (dist_m2 / 1000.0) if dist_m2 is not None else None
-                                    if dist_km2 is not None and dist_km2 <= max_radius_km:
-                                        too_far = False
-                                        dist_km = dist_km2
-                                    else:
-                                        too_far = True
-                                        dist_km = dist_km2
-                                else:
-                                    # accept retry if no center to compare
-                                    too_far = False
-                                    dist_km = None
-                                # update cache variable (if used)
-                                res = retry_res
-                        except Exception as e:
-                            self.log.debug(f"Retry geocode exception for '{addr}': {e}")
-
-                    # Final apply or flag
-                    if not too_far:
+                    # apply results to all rows that match this address
+                    idxs = df.index[df[col] == addr].tolist()
+                    if res and res.get("lat") is not None:
+                        lat_val = float(res["lat"])
+                        lon_val = float(res["lon"])
                         for i in idxs:
-                            # do not overwrite existing coords unless force_regeocode
                             if not force_regeocode and not pd.isna(df.at[i, lat_col]) and not pd.isna(df.at[i, lon_col]):
                                 continue
-                            df.at[i, lat_col] = lat_val
-                            df.at[i, lon_col] = lon_val
-                            df.at[i, flag_col] = ""  # clear flag
-                    else:
-                        # mark as out_of_radius and record issue
-                        for i in idxs:
-                            # optionally still write the geocoded coords but flag them
-                            df.at[i, lat_col] = lat_val
-                            df.at[i, lon_col] = lon_val
-                            flag_msg = f"out_of_radius:{dist_km:.2f}km" if dist_km is not None else "out_of_radius"
-                            df.at[i, flag_col] = flag_msg
-                            file_issues.append({
-                                "file": Path(csv_path).name,
+                    #         df.at[i, lat_col] = lat_val
+                    #         df.at[i, lon_col] = lon_val
+                    # else:
+                    #     # log issue rows for manual review (keep them as blank lat/lon)
+                    #     for i in idxs:
+                    #         self.log.debug(f"Geocode failed for file={csv_path.name}, row={i}, address_col={col}, address='{addr}'")
+                        per_row_school_key = school_key
+                        if school_columns_map and school_columns_map.get("school_name") in df.columns:
+                            try:
+                                sname_r = str(df.at[i, school_columns_map.get("school_name")]).strip().lower()
+                                sbranch_r = str(df.at[i, school_columns_map.get("school_branch")]).strip().lower()
+                                if sname_r:
+                                    per_row_school_key = f"{sname_r}__{sbranch_r}"
+                                self.log.info(f"Found per-row school key: {per_row_school_key}")
+                            except Exception:
+                                per_row_school_key = school_key
+                        # city/proximity check
+                        if per_row_school_key and not self._is_within_school_area(per_row_school_key, lat_val, lon_val):
+                            # issue: geocode result far from school center
+                            issues.append({
+                                "file": file_path.name,
+                                "column": col,
                                 "row_index": int(i),
-                                "address_col": col,
                                 "address": addr,
                                 "geocoded_lat": lat_val,
                                 "geocoded_lon": lon_val,
-                                "issue": "out_of_radius",
-                                "distance_km": dist_km
+                                "issue": "out_of_city_radius"
                             })
-                            self.log.warning(f"Geocode out_of_radius file={Path(csv_path).name} row={i} addr='{addr}' dist_km={dist_km}")
+                            # still write lat/lon but flagged (alternatively skip writing)
+                            df.at[i, lat_col] = lat_val
+                            df.at[i, lon_col] = lon_val
+                        else:
+                            df.at[i, lat_col] = lat_val
+                            df.at[i, lon_col] = lon_val
                 else:
-                    # geocode failed - flag all matching rows
+                    # geocode failed; log issue and leave blank
                     for i in idxs:
-                        df.at[i, flag_col] = "geocode_failed"
-                        file_issues.append({
-                            "file": Path(csv_path).name,
+                        issues.append({
+                            "file": file_path.name,
+                            "column": col,
                             "row_index": int(i),
-                            "address_col": col,
                             "address": addr,
                             "issue": "geocode_failed"
                         })
-                        self.log.debug(f"Geocode failed for file={Path(csv_path).name} row={i} addr='{addr}'")
-
-            # end for each unique addr
-
-            # save cache if updated
-            try:
-                if save_cache is not None:
+                # save cache if updated
+                try:
+                    from utils.cache_loader import save_cache
                     save_cache(cache)
-            except Exception as e:
-                self.log.debug(f"save_cache failed: {e}")
+                except Exception:
+                    pass
 
-        # end for each address column
+            # Any other processing/normalization you want can be placed here.
+            # For example: generate sibling group ids from same pickup address, etc.
 
-        # write file_issues if any
-        try:
-            if file_issues:
-                issues_df = pd.DataFrame(file_issues)
-                logs_dir = Path(self.cfg.get("paths", {}).get("logs", "logs"))
-                logs_dir.mkdir(parents=True, exist_ok=True)
-                out_issues = logs_dir / f"geocode_issues__{Path(csv_path).stem}.csv"
-                # append if exists to preserve previous runs
-                if out_issues.exists():
-                    issues_df.to_csv(out_issues, mode="a", header=False, index=False)
-                else:
-                    issues_df.to_csv(out_issues, index=False)
-                self.log.info(f"Wrote {len(file_issues)} geocode issues to {out_issues}")
-        except Exception as e:
-            self.log.debug(f"Failed to write geocode issues: {e}")
+            self.log.info(f"Completed processing for {csv_path.name}. Returning DataFrame to write canonical file.")
+            return df
 
-        self.log.info(f"Completed processing for {csv_path.name}")
-        return df
+
+        # def process_all_files(self, school_columns_map: Optional[Dict[str, str]] = None, force_regeocode: bool = False):
+        #     """
+        #     Process all CSV/XLSX/XLS files from the raw directory.
+        #     Converts Excel to a unique temporary CSV in the system temp folder to avoid
+        #     name collisions or double .tmp suffixes, then calls process_file on that temp CSV.
+        #     """
+        #     supported_exts = {".csv", ".xlsx", ".xls"}
+        #     files = sorted([p for p in self.raw_dir.glob("*") if p.suffix.lower() in supported_exts])
+
+        #     logging.info(f"Found {len(files)} files in raw dir: {[p.name for p in files]}")
+        #     if not files:
+        #         logging.warning("No CSV or Excel files found in raw dir.")
+        #         return
+
+        #     for f in files:
+        #         logging.info(f"--- Processing file: {f.name} ---")
+        #         tmp_csv_path = None
+        #         try:
+        #             # Read original file into dataframe (explicit engines for Excel)
+        #             if f.suffix.lower() == ".csv":
+        #                 df = pd.read_csv(f, dtype=str)
+        #                 # we can use the original csv directly (no tmp created)
+        #                 tmp_csv_path = f
+        #             elif f.suffix.lower() == ".xlsx":
+        #                 df = pd.read_excel(f, dtype=str, engine="openpyxl")
+        #             elif f.suffix.lower() == ".xls":
+        #                 df = pd.read_excel(f, dtype=str, engine="xlrd")
+        #             else:
+        #                 logging.warning(f"Skipping unsupported file type: {f.name}")
+        #                 continue
+
+        #             # If original file was not a CSV, write a unique temp CSV in system temp dir
+        #             if f.suffix.lower() != ".csv":
+        #                 tmp_dir = Path(tempfile.gettempdir())
+        #                 # unique filename: originalstem + uuid4 + timestamp
+        #                 unique_name = f"{f.stem}_{uuid.uuid4().hex[:8]}_{int(time.time())}.tmp.csv"
+        #                 tmp_csv_path = tmp_dir / unique_name
+        #                 df.to_csv(tmp_csv_path, index=False)
+        #                 logging.info(f"Saved temporary CSV for processing: {tmp_csv_path}")
+
+        #             # Now call process_file on a concrete csv path (tmp_csv_path points to a real file)
+        #             self.process_file(Path(tmp_csv_path), school_columns_map=school_columns_map, force_regeocode=force_regeocode)
+
+        #         except Exception as e:
+        #             logging.exception(f"Failed processing {f.name}: {e}")
+
+        #         finally:
+        #             # cleanup temporary CSV if we created one in tempdir
+        #             try:
+        #                 # only remove if tmp file is in the system temp dir (and not the original csv)
+        #                 if tmp_csv_path and tmp_csv_path.exists() and tmp_csv_path.parent == Path(tempfile.gettempdir()):
+        #                     tmp_csv_path.unlink()
+        #                     logging.debug(f"Removed temp file: {tmp_csv_path}")
+        #             except Exception as e:
+        #                 logging.debug(f"Failed to remove temp file {tmp_csv_path}: {e}")
+
+        #     logging.info("Done processing all files.")
 
     def process_all_files(self,
-                        school_columns_map: Optional[Dict[str, str]] = None,
-                        force_regeocode: bool = False):
+                          school_columns_map: Optional[Dict[str, str]] = None,
+                          force_regeocode: bool = False):
         """
         Process all CSV/XLSX/XLS files from the raw directory.
         For Excel files, create a unique temp CSV for processing.
         Each processed output overwrites canonical file in processed_dir:
-        raw file 'Student_Master.xlsx' -> processed file 'student_master.csv'
+          raw file 'Student_Master.xlsx' -> processed file 'student_master.csv'
         """
         supported_exts = {".csv", ".xlsx", ".xls"}
         files = sorted([p for p in Path(self.raw_dir).glob("*") if p.suffix.lower() in supported_exts])
