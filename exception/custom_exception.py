@@ -59,8 +59,3 @@ if __name__ == "__main__":
     except Exception as e:
         raise CustomException("Division failed", e) from e
 
-#     # Demo-2: still supports sys (old pattern)
-#     # try:
-#     #     a = int("abc")
-#     # except Exception as e:
-#     #     raise CustomException(e, sys)

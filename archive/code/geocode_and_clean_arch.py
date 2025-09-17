@@ -275,7 +275,160 @@ class GeocodeCleaner:
             return False
         return d <= self.max_city_radius_km
 
+    # ---------- Processing a single file ----------
+    # def process_file(self, file_path: Path, school_columns_map: Optional[Dict[str,str]] = None, force_regeocode: bool = False):
+    #     """
+    #     file_path: path to CSV file to process
+    #     school_columns_map: optional mapping to identify school name/branch columns in the file (keys: 'school_name','school_branch')
+    #     force_regeocode: if True, geocode even if lat/lon present or in cache
+    #     """
+    #     self.log.info(f"Processing file: {file_path}")
 
+    #     if file_path.suffix.lower() == ".csv":
+    #         df = pd.read_csv(file_path, dtype=str)
+    #     elif file_path.suffix.lower() == ".xlsx":
+    #         df = pd.read_excel(file_path, dtype=str, engine="openpyxl")
+    #     else:
+    #         self.log.warning(f"Skipping unsupported file type: {file_path.name}")
+
+    #     # df = pd.read_excel(file_path, dtype=str)
+    #     # normalize column names
+    #     df.rename(
+    #     columns={c: c.strip().lower().replace(" ", "_") for c in df.columns}, inplace=True)
+    #     # lowercase textual columns
+    #     for col in list(df.columns):
+    #         if is_text_dtype(df[col]):
+    #             df[col] = df[col].fillna("").astype(str).str.strip().str.lower()
+    #     # detect address-like columns
+    #     address_cols = self._find_address_cols(df)
+    #     self.log.info(f"Found {len(address_cols)} address-like columns in {file_path}")
+    #     # attempt to find school key for validation
+    #     school_key = None
+    #     if school_columns_map:
+    #         sname_col = school_columns_map.get("school_name")
+    #         sbranch_col = school_columns_map.get("school_branch")
+    #         if sname_col and sbranch_col and sname_col in df.columns and sbranch_col in df.columns:
+    #             # take first row's school name/branch for file-level validation (if multiple schools exist, validation will be per-row below)
+    #             try:
+    #                 sname = str(df[sname_col].iloc[0]).strip().lower()
+    #                 sbranch = str(df[sbranch_col].iloc[0]).strip().lower()
+    #                 school_key = f"{sname}__{sbranch}"
+    #                 self.log.info(f"Found school key: {school_key}")
+
+    #             except Exception:
+    #                 school_key = None
+
+    #     issues = []
+    #     # for each address column, ensure lat/lon columns and geocode missing values
+    #     for col in address_cols:
+    #         lat_col = f"{col}{self.lat_suffix}"
+    #         lon_col = f"{col}{self.lon_suffix}"
+    #         # ensure lat/lon columns exist
+    #         if lat_col not in df.columns:
+    #             df[lat_col] = ""
+    #         if lon_col not in df.columns:
+    #             df[lon_col] = ""
+    #         # convert existing lat/lon to numeric where present
+    #         df[lat_col] = pd.to_numeric(df[lat_col], errors="coerce")
+    #         df[lon_col] = pd.to_numeric(df[lon_col], errors="coerce")
+
+    #         # identify rows that need geocoding:
+    #         # - lat or lon is missing or NaN OR force_regeocode True
+    #         mask_need = df[lat_col].isna() | df[lon_col].isna() if not force_regeocode else pd.Series(True, index=df.index)
+    #         # but skip empty addresses
+    #         mask_need = mask_need & (df[col].astype(bool))
+
+    #         # reduce to unique addresses to minimize calls
+    #         unique_addrs = df.loc[mask_need, col].dropna().unique().tolist()
+    #         self.log.info(f"Geocoding {len(unique_addrs)} unique addresses for column '{col}'")
+
+    #         for addr in tqdm(unique_addrs, desc=f"Geocoding {file_path.name}:{col}", leave=False):
+    #             # res = self.geocode_with_cache(addr)
+
+    #             # Determine per-row school key
+    #             per_row_school_key = None
+    #             if school_columns_map and school_columns_map.get("school_name") in df.columns:
+    #                 sname_r = str(df.at[i, school_columns_map.get("school_name")]).strip().lower()
+    #                 sbranch_r = str(df.at[i, school_columns_map.get("school_branch")]).strip().lower()
+    #                 per_row_school_key = f"{sname_r}__{sbranch_r}"
+    #             # get hint_city from loaded centers
+    #             hint_city = None
+    #             if getattr(self, "_school_centers", None) is None:
+    #                 self._load_school_centers()
+    #             center = self._school_centers.get(per_row_school_key) if per_row_school_key else None
+    #             if center and center.get("location"):
+    #                 hint_city = center["location"]
+
+    #             # finally call geocoding with hint
+    #             res = self.geocode_with_cache(addr, hint_city=hint_city)
+
+    #             # apply to all rows with this addr
+    #             idxs = df.index[df[col] == addr].tolist()
+    #             if res and res.get("lat") is not None:
+    #                 lat_val = float(res["lat"])
+    #                 lon_val = float(res["lon"])
+    #                 # city validation: if we can find school per-row, validate below; else use file-level school_key
+    #                 for i in idxs:
+    #                     # if row already had lat/lon and not force, skip overwrite
+    #                     if not force_regeocode and not pd.isna(df.at[i, lat_col]) and not pd.isna(df.at[i, lon_col]):
+    #                         continue
+    #                     # if school columns present per-row, build per-row school_key
+    #                     per_row_school_key = school_key
+    #                     if school_columns_map and school_columns_map.get("school_name") in df.columns:
+    #                         try:
+    #                             sname_r = str(df.at[i, school_columns_map.get("school_name")]).strip().lower()
+    #                             sbranch_r = str(df.at[i, school_columns_map.get("school_branch")]).strip().lower()
+    #                             if sname_r:
+    #                                 per_row_school_key = f"{sname_r}__{sbranch_r}"
+    #                             self.log.info(f"Found per-row school key: {per_row_school_key}")
+    #                         except Exception:
+    #                             per_row_school_key = school_key
+    #                     # city/proximity check
+    #                     if per_row_school_key and not self._is_within_school_area(per_row_school_key, lat_val, lon_val):
+    #                         # issue: geocode result far from school center
+    #                         issues.append({
+    #                             "file": file_path.name,
+    #                             "column": col,
+    #                             "row_index": int(i),
+    #                             "address": addr,
+    #                             "geocoded_lat": lat_val,
+    #                             "geocoded_lon": lon_val,
+    #                             "issue": "out_of_city_radius"
+    #                         })
+    #                         # still write lat/lon but flagged (alternatively skip writing)
+    #                         df.at[i, lat_col] = lat_val
+    #                         df.at[i, lon_col] = lon_val
+    #                     else:
+    #                         df.at[i, lat_col] = lat_val
+    #                         df.at[i, lon_col] = lon_val
+    #             else:
+    #                 # geocode failed; log issue and leave blank
+    #                 for i in idxs:
+    #                     issues.append({
+    #                         "file": file_path.name,
+    #                         "column": col,
+    #                         "row_index": int(i),
+    #                         "address": addr,
+    #                         "issue": "geocode_failed"
+    #                     })
+    #         # END for addr
+    #     # END for address_cols
+
+    #     # write processed file
+    #     out_path = self.proc_dir / file_path.name
+    #     df.to_csv(out_path, index=False)
+    #     self.log.info(f"  wrote processed file: {out_path}")
+
+    #     # save issues for manual review
+    #     if issues:
+    #         issues_df = pd.DataFrame(issues)
+    #         empty_directory(self.issues_dir)
+    #         issues_out = self.issues_dir / f"geocode_issues__{file_path.name}"
+    #         issues_df.to_csv(issues_out.with_suffix(".csv"), index=False)
+    #         self.log.info(f"  issues written to {issues_out.with_suffix('.csv')}")
+    #     # save updated cache
+    #     save_cache(self.cache)
+    #     return out_path
 
     def process_file(self,
                         csv_path: Path,

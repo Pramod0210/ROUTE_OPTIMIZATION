@@ -16,8 +16,12 @@ paths:
   raw_data: "data/raw"
   processed_data: "data/processed"
   geocode_cache: "data/geocode_cache.csv"
+  issues_data: "data/issues"
   logs: "logs"
   school_master: "data/raw/School_Master.xlsx"
+  students_processed: "data/processed/students_processed.csv"
+  stops_output: "data/processed/stops.csv"
+  students_with_stops_output: "data/processed/students_with_stops.csv"
 
 geocode:
   nominatim_delay: 1.1
@@ -32,6 +36,21 @@ address_keywords:
   - "pickup address"
   - "drop address"
   - "parking spot"
+
+
+constraints:
+  max_walk_meters: 300
+
+clustering:
+  mode: "distance"                # or "society"
+  society_split_within_meters: 0  # 0 means no internal split; >0 will split large societies
+
+dwell_time_bands:
+  - {min: 1, max: 2, wait_min: 2}
+  - {min: 3, max: 5, wait_min: 3}
+  - {min: 6, max: 9999, wait_min: 4}
+
+
 
 
 lat_suffix: "_lat"
