@@ -19,9 +19,13 @@ paths:
   issues_data: "data/issues"
   logs: "logs"
   school_master: "data/raw/School_Master.xlsx"
-  students_processed: "data/processed/students_processed.csv"
-  stops_output: "data/processed/stops.csv"
-  students_with_stops_output: "data/processed/students_with_stops.csv"
+  bus_stop_time: "data/processed/bus_stop_time.csv"
+  students_processed: "data/processed/student_master.csv"
+  teachers_processed: "data/processed/teacher_master.csv"
+  stops_pickup_output: "data/processed/stops_pickup.csv"
+  stops_drop_output: "data/processed/stops_drop.csv"
+  participants_with_stops_pickup: "data/processed/participants_with_stops_pickup.csv"
+  participants_with_stops_drop: "data/processed/participants_with_stops_drop.csv"
 
 geocode:
   nominatim_delay: 1.1
@@ -44,13 +48,6 @@ constraints:
 clustering:
   mode: "distance"                # or "society"
   society_split_within_meters: 0  # 0 means no internal split; >0 will split large societies
-
-dwell_time_bands:
-  - {min: 1, max: 2, wait_min: 2}
-  - {min: 3, max: 5, wait_min: 3}
-  - {min: 6, max: 9999, wait_min: 4}
-
-
 
 
 lat_suffix: "_lat"
