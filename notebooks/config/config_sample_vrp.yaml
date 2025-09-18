@@ -1,0 +1,20 @@
+constraints:
+  max_bus_km_per_month: 2500
+  max_occupancy: 0.9
+geocode:
+  sleep_between_calls: 0.1
+paths:
+  bus_master: d:\Freelance\Route_Optimization\notebooks\data\sample\bus_master.csv
+  parking_spots: d:\Freelance\Route_Optimization\notebooks\data\sample\bus_parking_spot.csv
+  participants_with_stops_pickup: d:\Freelance\Route_Optimization\notebooks\data\sample\participants_with_stops_pickup.csv
+  route_cache: d:\Freelance\Route_Optimization\notebooks\data\route_cache.csv
+  stops_pickup: d:\Freelance\Route_Optimization\notebooks\data\sample\stops_pickup.csv
+  student_travel_time: d:\Freelance\Route_Optimization\notebooks\data\sample\Student_Travel_Time.csv
+routing:
+  avg_speed_kmph: 25
+  max_vehicles_per_branch: 6
+  school_days_per_month: 22
+  search_time_limit_seconds: 20
+  use_google_directions: true
+validation:
+  max_city_radius_km: 50.0

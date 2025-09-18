@@ -61,3 +61,9 @@ def listify(x):
         return [s.strip() for s in x.split(",") if s.strip()]
     return list(x)
 
+def minutes_from_hhmm(s: str) -> int:
+    """'08:30' -> minutes from midnight"""
+    if not s or pd.isna(s):
+        return 0
+    h, m = s.split(":")
+    return int(h) * 60 + int(m)

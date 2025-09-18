@@ -14,4 +14,5 @@ ipywidgets==8.1.7
 ipyleaflet==0.20.0
 googlemaps==4.10.0
 pulp==3.3.0
+ortools==9.14.6206
 -e .
