@@ -38,3 +38,26 @@ def empty_directory(directory_path):
         except OSError as e:
             print(f"Error: Failed to remove {item_path}. Reason: {e}")
 
+def travel_time_min_km(km, avg_speed_kmph):
+    # time in minutes
+    """
+    Calculates the travel time in minutes given a distance in kilometers and an average speed in kilometers per hour.
+
+    """
+    if km is None:
+        return None
+    hours = km / float(max(0.1, avg_speed_kmph))
+    return hours * 60.0
+
+def listify(x):
+    """
+    Converts input x to a list, handling special cases for lists, NaN/None, strings, and other types.
+    """
+    if isinstance(x, list):
+        return x
+    if pd.isna(x) or x is None:
+        return []
+    if isinstance(x, str):
+        return [s.strip() for s in x.split(",") if s.strip()]
+    return list(x)
+

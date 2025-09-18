@@ -1,11 +1,20 @@
 constraints:
-  max_bus_km_per_month: 4500
-  max_bus_km_per_day: 150
+  max_bus_km_per_month: 9000
+  max_bus_km_per_day: 300
   max_bus_time_per_day: 900 # minutes
   max_occupancy: 0.9
   stop_wait_time: 3
   reserve_buses: 3
   max_student_ride_time: 60  # minutes
+  max_walk_meters: 300
+
+routing:
+  avg_speed_kmph: 50
+  max_trip_time_min: 120
+  max_trip_km: 150
+  use_google_directions: true
+  google_profile: "driving"
+  school_days_per_month: 22
 
 calendar:
   regular_start: "08:00"
@@ -26,11 +35,16 @@ paths:
   stops_drop_output: "data/processed/stops_drop.csv"
   participants_with_stops_pickup: "data/processed/participants_with_stops_pickup.csv"
   participants_with_stops_drop: "data/processed/participants_with_stops_drop.csv"
+  bus_master: "data/processed/bus_master.csv"
+  parking_spots: "data/processed/bus_parking.csv"
+  route_cache: "data/geocode_routes_cache.csv"   # where route fetcher caches route lookups
+
 
 geocode:
   nominatim_delay: 1.1
   sleep_between_calls: 0.2
   max_retries: 3
+  google_maps_api_key_env: "GOOGLE_MAPS_API_KEY"  # environment variable name
 
 validation:
   max_city_radius_km: 100.0
@@ -41,9 +55,6 @@ address_keywords:
   - "drop address"
   - "parking spot"
 
-
-constraints:
-  max_walk_meters: 300
 
 clustering:
   mode: "distance"                # or "society"
