@@ -14,6 +14,7 @@ routing:
   max_trip_km: 150
   use_google_directions: true
   google_profile: "driving"
+  travel_mode: "TRANSIT"
   school_days_per_month: 22
 
 calendar:

@@ -110,11 +110,13 @@ class RouteFetcher:
             try:
                 # use 'driving' profile by default
                 profile = self.cfg.get("routing", {}).get("google_profile", "driving")
+                travel_mode = self.cfg.get("routing", {}).get("travel_mode", "transit")
+
                 # googlemaps directions accepts origin/destination as "lat,lng"
                 o_str = f"{origin[0]},{origin[1]}"
                 d_str = f"{destination[0]},{destination[1]}"
                 # call directions
-                res = self.client.directions(origin=o_str, destination=d_str, mode=profile)
+                res = self.client.directions(origin=o_str, destination=d_str, mode=profile, transit_mode=travel_mode)
                 time.sleep(self.sleep_between_calls)
                 if res and len(res) > 0:
                     # sum legs if multiple

@@ -37,128 +37,142 @@ class FleetOptimizer:
         if 'empty_seats' not in self.bus_master.columns:
             self.bus_master['empty_seats'] = pd.NA
 
-    def solve(self) -> Dict[str,Any]:
-        # prepare sets
+    def solve(self, time_limit_seconds) -> Dict[str, Any]:
         """
-        Solve an integer MIP to choose number of buses per type and assign trips to bus types.
+        Solve the fleet sizing + trip assignment MIP.
 
-        Returns a dict with:
-            - status: MIP solve status
-            - total_cost: total fixed cost of buses assigned
-            - buses_needed: dict of bus type indices to number of buses needed
-            - bus_types: list of bus type dicts with index, vendor, seating_capacity, available_buses, empty_seats, fixed_cost, usable_capacity, buses_assigned
-            - trip_assignments: dict of trip_ids to bus type dicts with index, vendor, seating_capacity, usable_capacity
-            - problem: the pulp problem object for inspection
+        Expects:
+        - self.trip_records: list of dicts each with keys ['trip_id','est_km','students_on_trip']
+        - self.bus_master_df: DataFrame with seating_capacity, available_buses, fixed_cost, empty_seats (optional)
+
+        Returns dict:
+        - status, total_cost, buses_needed (by bus_type_index), trip_assignments (trip_id -> assigned bus_type_index), bus_types (list)
         """
-        trip_ids = [t['trip_id'] for t in self.trips]
-        K = list(self.bus_master.index)  # bus type indices
+        import pulp
 
-        # build usable capacity per type: if empty_seats present use it, else floor(capacity * max_occupancy)
-        usable_cap = {}
-        for k in K:
-            cap = int(self.bus_master.at[k, 'seating_capacity'])
-            es = self.bus_master.at[k, 'empty_seats']
-            if pd.isna(es):
-                usable = math.floor(cap * self.max_occupancy)
-            else:
-                try:
-                    usable = int(cap - int(es))
-                except Exception:
-                    usable = math.floor(cap * self.max_occupancy)
-            usable_cap[k] = max(0, usable)
+        # --- normalize trips ---
+        trips = []
+        trip_by_id = {}
+        for rec in self.trips:
+            # required fields
+            tid = str(rec.get("trip_id") or rec.get("trip") or f"trip_{len(trips)}")
+            est_km = float(rec.get("est_km", 0.0))
+            students = int(rec.get("students_on_trip", rec.get("students", rec.get("num_participants", 0))))
+            trips.append(tid)
+            trip_by_id[tid] = {"est_km": est_km, "students_on_trip": students}
 
-        # build trip_km_month = est_km * school_days (each trip occurs once per school day)
-        trip_km_month = {}
-        for t in self.trips:
-            trip_km_month[t['trip_id']] = float(t.get('est_km', 0.0)) * float(self.school_days)
+        if len(trips) == 0:
+            return {"status": "no_trips", "total_cost": 0.0, "buses_needed": {}, "trip_assignments": {}, "bus_types": []}
 
-        # create LP
-        prob = pulp.LpProblem("fleet_sizing", pulp.LpMinimize)
-
-        # decision vars:
-        # y_tk = 1 if trip t assigned to bus type k
-        y = pulp.LpVariable.dicts("y", ((t,k) for t in trip_ids for k in K), lowBound=0, upBound=1, cat='Binary')
-        # buses_k = integer number of buses of type k
-        buses = pulp.LpVariable.dicts("buses", (k for k in K), lowBound=0, cat='Integer')
-
-        # objective: minimize sum_k buses_k * fixed_cost_k
-        prob += pulp.lpSum([buses[k] * float(self.bus_master.at[k, 'fixed_cost']) for k in K])
-
-        # constraints:
-        # (1) every trip assigned exactly once
-        for t in trip_ids:
-            prob += pulp.lpSum([y[(t,k)] for k in K]) == 1, f"assign_{t}"
-
-        # (2) seating capacity: y_tk = 0 if usable_cap[k] < students_on_trip
-        for t in self.trips:
-            req = int(t.get('students_on_trip', 0))
-            for k in K:
-                if usable_cap[k] < req:
-                    prob += y[(t,k)] == 0, f"cap_forbid_{t}_{k}"
-
-        # (3) monthly km capacity: for each bus type k, buses_k * cap_month >= sum_t y_tk * trip_km_month[t]
-        for k in K:
-            prob += buses[k] * self.max_bus_km_per_month >= pulp.lpSum([ y[(t,k)] * trip_km_month[t] for t in trip_ids ]), f"kmcap_{k}"
-
-        # (4) available buses upper bound
-        for k in K:
-            prob += buses[k] <= int(self.bus_master.at[k, 'available_buses']), f"avail_{k}"
-
-        # Solve
-        solver = pulp.PULP_CBC_CMD(msg=True, timeLimit=300, threads=0)
-        result = prob.solve(solver)
-
-        status = pulp.LpStatus[result]
-        self.log.info(f"MIP solve status: {status}")
-
-        # collect solution
-        assignment = {}
-        for t in trip_ids:
-            for k in K:
-                if pulp.value(y[(t,k)]) >= 0.5:
-                    assignment[t] = int(k)
-                    break
-
-        buses_needed = {}
-        for k in K:
-            val = int(pulp.value(buses[k]) or 0)
-            buses_needed[int(k)] = val
-
-        total_cost = sum(buses_needed.get(k,0) * float(self.bus_master.at[k,'fixed_cost']) for k in K)
-
-        # interpret bus type indices into readable dicts
+        # --- normalize bus types ---
         bus_types = []
-        for k in K:
+        for _, r in self.bus_master.iterrows():
+            seating = int(r.get("seating_capacity") or r.get("seating", 0))
+            available = int(r.get("available_buses") or r.get("available", 0) or 0)
+            fixed_cost = float(r.get("fixed_cost") or 0.0)
+            empty = r.get("empty_seats", None)
+            if empty is None or (isinstance(empty, float) and pd.isna(empty)) or empty == "":
+                usable = int(math.floor(seating * float(self.cfg.get("constraints", {}).get("max_occupancy", 0.9))))
+            else:
+                usable = max(0, seating - int(empty))
             bus_types.append({
-                "index": int(k),
-                "vendor": self.bus_master.at[k, 'vendor'],
-                "seating_capacity": int(self.bus_master.at[k, 'seating_capacity']),
-                "available_buses": int(self.bus_master.at[k, 'available_buses']),
-                "empty_seats": int(self.bus_master.at[k, 'empty_seats']) if pd.notna(self.bus_master.at[k, 'empty_seats']) else None,
-                "fixed_cost": float(self.bus_master.at[k, 'fixed_cost']),
-                "usable_capacity": usable_cap[k],
-                "buses_assigned": buses_needed.get(k, 0)
+                "vendor": r.get("vendor"),
+                "seating_capacity": seating,
+                "available_buses": available,
+                "fixed_cost": fixed_cost,
+                "empty_seats": empty,
+                "usable_capacity": usable
             })
 
-        # map trip assignments to bus type descriptions
+        K = list(range(len(bus_types)))
+        if len(K) == 0:
+            return {"status": "no_bus_types", "total_cost": 0.0, "buses_needed": {}, "trip_assignments": {}, "bus_types": []}
+
+        # --- parameters ---
+        max_bus_km_per_month = float(self.cfg.get("constraints", {}).get("max_bus_km_per_month", 2500))
+        school_days = int(self.cfg.get("routing", {}).get("school_days_per_month", 22))
+
+        # monthly km required by trip t = est_km * school_days * 2? (if both pickup+drop counted separately)
+        # Here we assume est_km is per-trip (one-way). If trips are round-trip, adjust accordingly.
+        trip_monthly_km = {t: trip_by_id[t]["est_km"] * school_days for t in trips}
+        trip_students = {t: trip_by_id[t]["students_on_trip"] for t in trips}
+
+        # --- build problem ---
+        prob = pulp.LpProblem("FleetSizingAssign", pulp.LpMinimize)
+
+        # variables
+        # buses_k: number of buses of type k (integer, 0..available)
+        buses_k = {k: pulp.LpVariable(f"buses_k_{k}", lowBound=0, upBound=bus_types[k]["available_buses"], cat="Integer") for k in K}
+
+        # y_tk: binary, 1 if trip t is assigned to bus type k
+        y = {(t,k): pulp.LpVariable(f"y_{t}_{k}", cat="Binary") for t in trips for k in K}
+
+        # objective: minimize monthly fixed cost sum_k buses_k * fixed_cost_k
+        prob += pulp.lpSum([buses_k[k] * bus_types[k]["fixed_cost"] for k in K]), "TotalFixedCost"
+
+        # constraints
+        # (A) Each trip assigned to exactly one bus type
+        for t in trips:
+            prob += pulp.lpSum([y[(t,k)] for k in K]) == 1, f"assign_once_{t}"
+
+        # (B) capacity: if usable_cap[k] < trip_students[t] then forbid y[t,k]==1
+        for t in trips:
+            req = trip_students[t]
+            for k in K:
+                if bus_types[k]["usable_capacity"] < req:
+                    prob += y[(t,k)] == 0, f"cap_forbid_{t}_{k}"
+
+        # (C) buses available & assignment linkage:
+        # sum_t y[t,k] <= buses_k[k] * max_trips_per_bus_per_month
+        # but we don't know trips-per-bus; simplest conservative approach: require buses_k[k] * max_bus_km_per_month >= sum_t y[t,k] * trip_monthly_km[t]
+        for k in K:
+            prob += pulp.lpSum([y[(t,k)] * trip_monthly_km[t] for t in trips]) <= buses_k[k] * max_bus_km_per_month, f"km_capacity_{k}"
+            # also cannot assign more trips than buses * huge (optional)
+            # prob += pulp.lpSum([y[(t,k)] for t in trips]) <= buses_k[k] * 2000, f"trip_count_upper_{k}"
+
+        # (D) available buses upper bound is set on buses_k variable (via upBound). Optionally enforce explicit bound:
+        for k in K:
+            prob += buses_k[k] <= bus_types[k]["available_buses"], f"available_bound_{k}"
+
+        # Solve
+        # optional time limit for pulp CBC
+        solver = None
+        if time_limit_seconds:
+            solver = pulp.PULP_CBC_CMD(timeLimit=int(time_limit_seconds), msg=False)
+        else:
+            solver = pulp.PULP_CBC_CMD(msg=False)
+
+        prob.solve(solver)
+
+        status = pulp.LpStatus.get(prob.status, str(prob.status))
+        # gather solution
+        buses_needed = {k: int(pulp.value(buses_k[k]) or 0) for k in K}
         trip_assignments = {}
-        for t in trip_ids:
-            k = assignment.get(t)
-            if k is None:
-                trip_assignments[t] = None
-            else:
-                trip_assignments[t] = {
-                    "bus_type_index": int(k),
-                    "vendor": self.bus_master.at[k, 'vendor'],
-                    "seating_capacity": int(self.bus_master.at[k, 'seating_capacity']),
-                    "usable_capacity": usable_cap[k]
-                }
+        for t in trips:
+            assigned = None
+            for k in K:
+                val = pulp.value(y[(t,k)])
+                if val is not None and float(val) > 0.5:
+                    assigned = int(k)
+                    break
+            trip_assignments[t] = {"assigned_bus_type": assigned, "assigned_bus_vendor": bus_types[assigned]["vendor"] if assigned is not None else None}
+
+        total_cost = sum(buses_needed[k] * bus_types[k]["fixed_cost"] for k in K)
+
+        # augment bus_types with assigned count
+        bus_types_with_assign = []
+        for k in K:
+            bt = dict(bus_types[k])
+            bt["index"] = k
+            bt["buses_assigned"] = buses_needed.get(k, 0)
+            bus_types_with_assign.append(bt)
 
         return {
             "status": status,
-            "total_cost": total_cost,
+            "total_cost": float(total_cost),
             "buses_needed": buses_needed,
-            "bus_types": bus_types,
             "trip_assignments": trip_assignments,
+            "bus_types": bus_types_with_assign,
             "problem": prob
         }
+
