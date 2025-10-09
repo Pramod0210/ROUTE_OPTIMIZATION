@@ -486,3 +486,7 @@ class VRPTripOptimizer:
             return {"routes_df": pd.DataFrame(), "trip_records": [], "status": "no_solution", "impossible_stops_df": imp_df, "time_sec": elapsed}
 
 
+if __name__ == "__main__":
+    vro = VRPTripOptimizer()
+    print("VRPTripOptimizer initialized.")
+    vro.solve_branch()

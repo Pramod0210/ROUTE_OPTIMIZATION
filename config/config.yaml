@@ -39,6 +39,7 @@ paths:
   bus_master: "data/processed/bus_master.csv"
   parking_spots: "data/processed/bus_parking.csv"
   route_cache: "data/geocode_routes_cache.csv"   # where route fetcher caches route lookups
+  student_travel_time: "data/processed/student_travel_time.csv"
 
 
 geocode:
