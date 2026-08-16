@@ -5,12 +5,24 @@ build/
 dist/
 wheels/
 *.egg-info
+ROUTE_OPTIMIZATION.egg-info
 
 # Virtual environments
 myvenv
+.venv
+venv
+
+# Secrets
 .env
-data
-raw_data
-ROUTE_OPTIMIZATION.egg-info
-logs
-results
+*.key
+
+# Data — never commit student records or geocode caches
+data/
+raw_data/
+*.xlsx
+*.xls
+*.csv
+
+# Outputs
+logs/
+results/
